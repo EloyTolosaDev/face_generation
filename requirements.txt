@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+
+diffusers>=0.22.0
+transformers>=4.35.0
+accelerate>=0.24.0
+safetensors>=0.4.0
+huggingface_hub>=0.19.0
+
+compel>=2.3.0
+pillow>=10.0.0
+numpy>=1.24.0
+tqdm>=4.66.0
