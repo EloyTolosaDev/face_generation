@@ -221,9 +221,37 @@ def create_image(meta: dict[str, Any]) -> str:
     return image_path.as_posix()
 
 
-def iter_batches(items: List[Path], batch_size: int) -> Iterator[List[Path]]:
+def iter_batches(items: List[Any], batch_size: int) -> Iterator[List[Any]]:
     for start in range(0, len(items), batch_size):
         yield items[start:start + batch_size]
+
+
+def resolve_image_path_from_meta(meta_path: Path, meta: dict[str, Any]) -> Path:
+    """
+    Build output path from the meta file location.
+    Expected layout: <expression>/meta/<file>.json -> <expression>/images/<file>.png
+    """
+    if meta_path.parent.name.lower() == "meta":
+        expression_dir = meta_path.parent.parent
+    else:
+        # Fallback for non-standard meta layouts.
+        expression_name = sanitize_token(str(meta.get("expression", "expression")))
+        expression_dir = meta_path.parent / expression_name
+
+    return expression_dir / "images" / f"{meta_path.stem}.png"
+
+
+def load_render_meta(meta_path: Path, config: Config) -> dict[str, Any]:
+    with meta_path.open("r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    # When rendering from meta, keep identity from meta (prompt/seed/expression),
+    # but allow these runtime quality controls from CLI config.
+    meta["img_size"] = config.imgSize
+    meta["steps"] = config.steps
+    meta["cfg"] = config.cfg
+    meta["image_path"] = resolve_image_path_from_meta(meta_path, meta).as_posix()
+    return meta
 
 
 def render_images_from_meta(meta_paths: List[Path], config: Config) -> None:
@@ -231,51 +259,52 @@ def render_images_from_meta(meta_paths: List[Path], config: Config) -> None:
         print("No meta files to render.")
         return
 
-    ## create images subfolder 
-    os.makedirs(config.outDir/"images", exist_ok=True)
-
     use_cuda = config.gpuOn and torch.cuda.is_available()
     if config.gpuOn and not torch.cuda.is_available():
         print("Config.gpuOn=True but CUDA is not available. Falling back to CPU.")
 
-    if use_cuda:
-        workers = 1
-        print("GPU mode detected: running create_image(meta) with 1 worker to avoid GPU contention.")
-    else:
-        workers = max(1, min(config.parallelBatchSize, len(meta_paths)))
-        print(f"CPU mode: running create_image(meta) in batches of {workers} parallel executions.")
-
     ctx = mp.get_context("spawn")
-    total_batches = (len(meta_paths) + workers - 1) // workers
     rendered_images = 0
 
-    with ProcessPoolExecutor(
-        max_workers=workers,
-        mp_context=ctx,
-        initializer=_init_image_worker,
-        initargs=(config.modelId, use_cuda, config.numThreads),
-    ) as executor:
-        for batch_index, batch_paths in enumerate(iter_batches(meta_paths, workers), start=1):
-            batch_metas: List[dict[str, Any]] = []
-            for meta_path in batch_paths:
-                with meta_path.open("r", encoding="utf-8") as f:
-                    batch_metas.append(json.load(f))
+    render_metas = [load_render_meta(meta_path, config) for meta_path in meta_paths]
 
-            futures = {executor.submit(create_image, meta): meta for meta in batch_metas}
+    metas_by_model: dict[str, List[dict[str, Any]]] = {}
+    for meta in render_metas:
+        model_id = str(meta.get("model_id") or config.modelId)
+        metas_by_model.setdefault(model_id, []).append(meta)
 
-            for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc=f"Phase 2/2 - Batch {batch_index}/{total_batches}",
-                unit="img",
-            ):
-                try:
-                    future.result()
-                    rendered_images += 1
-                except Exception as exc:
-                    failed_meta = futures[future]
-                    failed_path = failed_meta.get("image_path", "unknown")
-                    raise RuntimeError(f"Failed rendering image for meta target: {failed_path}") from exc
+    for model_id, model_metas in metas_by_model.items():
+        if use_cuda:
+            workers = 1
+            print(f"GPU mode ({model_id}): running create_image(meta) with 1 worker to avoid GPU contention.")
+        else:
+            workers = max(1, min(config.parallelBatchSize, len(model_metas)))
+            print(f"CPU mode ({model_id}): running create_image(meta) in batches of {workers} parallel executions.")
+
+        total_batches = (len(model_metas) + workers - 1) // workers
+
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=ctx,
+            initializer=_init_image_worker,
+            initargs=(model_id, use_cuda, config.numThreads),
+        ) as executor:
+            for batch_index, batch_metas in enumerate(iter_batches(model_metas, workers), start=1):
+                futures = {executor.submit(create_image, meta): meta for meta in batch_metas}
+
+                for future in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc=f"Phase 2/2 - Batch {batch_index}/{total_batches}",
+                    unit="img",
+                ):
+                    try:
+                        future.result()
+                        rendered_images += 1
+                    except Exception as exc:
+                        failed_meta = futures[future]
+                        failed_path = failed_meta.get("image_path", "unknown")
+                        raise RuntimeError(f"Failed rendering image for meta target: {failed_path}") from exc
 
     print(f"Rendered {rendered_images} images.")
 
