@@ -7,132 +7,22 @@ import re
 import time
 import torch
 
+from expression_spec import EXPRESSIONS, ExpressionSpec
+from au import ACTION_UNITS
+from config import Config
+
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict 
 from pathlib import Path
-from typing import Any, Iterator, List, Optional
+from typing import Any, Iterator, List
 from compel import Compel
 from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
 from tqdm import tqdm
 
-
-# -----------------------------
-# 2) AU -> concrete descriptions
-# -----------------------------
-
-
-@dataclass
-class AU:
-    id: int
-    light_desc: str
-    medium_desc: str
-    strong_desc: str
-
-    # Multiplying an AU by a float returns a weighted phrase for prompt generation.
-    def __mul__(self, intensity: float) -> str:
-        weight = intensity_to_weight(intensity)
-        if intensity <= 0:
-            return ""
-        if intensity <= 0.33:
-            return f"{self.light_desc}:{weight}"
-        if intensity <= 0.66:
-            return f"{self.medium_desc}:{weight}"
-        return f"{self.strong_desc}:{weight}"
-
-
-ACTION_UNITS = {
-    6: AU(
-        6,
-        light_desc="cheeks slightly lifted",
-        medium_desc="cheeks lifted, faint smile lines",
-        strong_desc="cheeks strongly raised, visible smile lines, slight eye squint",
-    ),
-    12: AU(
-        12,
-        light_desc="mouth corners slightly upturned",
-        medium_desc="mouth corners upturned",
-        strong_desc="mouth corners strongly upturned, pronounced grin",
-    ),
-    25: AU(
-        25,
-        light_desc="lips slightly parted",
-        medium_desc="lips parted",
-        strong_desc="lips clearly parted",
-    ),
-    4: AU(
-        4,
-        light_desc="brows slightly drawn together",
-        medium_desc="brows furrowed, eyebrows pulled down and together",
-        strong_desc="brows strongly furrowed, deep crease between eyebrows",
-    ),
-    7: AU(
-        7,
-        light_desc="eyes slightly narrowed",
-        medium_desc="eyes narrowed, tense eyelids",
-        strong_desc="eyes tightly narrowed, intense eyelid tension",
-    ),
-    23: AU(
-        23,
-        light_desc="mouth slightly tense",
-        medium_desc="lips tightened, mouth tense",
-        strong_desc="lips strongly tightened, rigid tense mouth",
-    ),
-    24: AU(
-        24,
-        light_desc="lips gently pressed together",
-        medium_desc="lips pressed together firmly",
-        strong_desc="lips pressed tightly together, strong mouth tension",
-    ),
-    17: AU(
-        17,
-        light_desc="chin slightly raised",
-        medium_desc="chin raised, lower lip pushed upward",
-        strong_desc="chin strongly raised, pronounced lower-lip and chin tension",
-    ),
-    5: AU(
-        5,
-        light_desc="eyes slightly more open",
-        medium_desc="upper eyelids raised, eyes more open",
-        strong_desc="upper eyelids strongly raised, eyes wide open",
-    ),
-    10: AU(
-        10,
-        light_desc="upper lip slightly raised",
-        medium_desc="upper lip raised, faint sneer",
-        strong_desc="upper lip strongly raised (risk: drifts toward disgust)",
-    ),
-}
-
-
-# ---------------------------------------
-# 3) Simple intensity -> weight mapping
-# ---------------------------------------
-def intensity_to_weight(x: float) -> float:
-    """
-    0.0 -> 0 (omit)
-    (0, 0.5] -> light -> 1.3
-    (0.5, 1.0] -> strong -> 1.7
-    """
-    if x <= 0.0:
-        return 0.0
-    if x <= 0.5:
-        return 1.3
-    return 1.7
-
-
-# ---------------------------------------
-# 4) Expression definitions
-# ---------------------------------------
-@dataclass
-class ExpressionSpec:
-    name: str
-    aus: dict[int, float]  # AU id -> intensity
-
-
-EXPRESSIONS: List[ExpressionSpec] = [
-    # ExpressionSpec("simple_smile", {12: 1.0, 6: 0.4, 25: 0.2}),
-    ExpressionSpec("simple:anger", {4: 1.0, 7: 0.7, 24: 0.8, 23: 0.5}),
-]
+def validate_expression_aus(expressions: List[ExpressionSpec]) -> None:
+    unknown_aus = sorted({au for spec in expressions for au in spec.aus if au not in ACTION_UNITS})
+    if unknown_aus:
+        raise ValueError(f"Unknown AU ids referenced by expressions: {unknown_aus}")
 
 
 # ---------------------------------------
@@ -160,89 +50,7 @@ AGE_GROUPS = [f"{age_range} years old" for age_range in ["15-20", "20-35", "35-5
 PARALLEL_BATCH_SIZE = 5
 
 
-@dataclass
-class Config:
-    expressions: List[str]
-    outDir: Path
-    modelId: str
-    imgSize: int
-    steps: int
-    cfg: float
-    seeds: int
-    gpuOn: bool
-    numThreads: int
-    dry: bool
-    parallelBatchSize: int
-    onlyMeta: bool
-    fromMeta: Optional[Path]
 
-    @classmethod
-    def from_args(cls, args: argparse.Namespace) -> "Config":
-        return cls(
-            expressions=args.expressions,
-            outDir=args.output,
-            modelId=args.model_id,
-            imgSize=args.image_size,
-            steps=args.steps,
-            cfg=args.cfg,
-            seeds=args.seeds,
-            gpuOn=args.gpu_on,
-            numThreads=args.num_threads,
-            dry=args.dry,
-            parallelBatchSize=args.parallel_batch_size,
-            onlyMeta=args.only_meta,
-            fromMeta=args.from_meta,
-        )
-
-
-def get_config_from_args() -> Config:
-    p = argparse.ArgumentParser()
-    p.add_argument(
-        "--model_id",
-        type=str,
-        default="emilianJR/epiCRealism",
-        help="Model checkpoint to generate images from.",
-    )
-    p.add_argument("--output", type=Path, required=True, help="Output directory for generated files")
-    p.add_argument("--image_size", type=int, default=512)
-    p.add_argument("--steps", type=int, default=20)
-    p.add_argument("--cfg", type=float, default=5.0)
-    p.add_argument(
-        "--seeds",
-        type=int,
-        default=1,
-        help="Amount of images per combination of age/ethnicity/gender/expression",
-    )
-    p.add_argument(
-        "--gpu_on",
-        default=False,
-        action="store_true",
-        help="Use CUDA GPU if available",
-    )
-    p.add_argument("--num_threads", type=int, default=min(8, os.cpu_count() or 8))
-    p.add_argument("--expressions", nargs="+", type=str, default=[])
-    p.add_argument(
-        "--parallel_batch_size",
-        type=int,
-        default=PARALLEL_BATCH_SIZE,
-        help="How many create_image(meta) calls run in parallel per batch",
-    )
-    p.add_argument(
-        "--dry",
-        default=False,
-        action="store_true",
-        help="Dry run: print config and expected file count",
-    )
-    p.add_argument(
-        "--only_meta",
-        default=False,
-        action="store_true",
-        help="Only meta means only generate json files needed to generate the images. By default, meta AND images are generated"
-    )
-    p.add_argument("--from_meta", type=Path, help="Only generate images from meta-files from a path where meta-files are on")
-
-    args = p.parse_args()
-    return Config.from_args(args)
 
 
 def sanitize_token(value: str) -> str:
@@ -255,6 +63,8 @@ def get_combinations() -> List[tuple[str, str]]:
 
 
 def get_selected_expressions(requested_names: List[str]) -> List[ExpressionSpec]:
+    validate_expression_aus(EXPRESSIONS)
+
     if not requested_names:
         return EXPRESSIONS
 
@@ -482,7 +292,7 @@ def main(config: Config) -> None:
 
 
 if __name__ == "__main__":
-    config = get_config_from_args()
+    config = Config.new()
 
     if config.dry:
         selected = get_selected_expressions(config.expressions)
