@@ -45,7 +45,7 @@ BASE_NEGATIVE = (
 ETHNICITIES = ["white", "asian", "black", "hispanic", "hawaiian", "alaskan-native"]
 GENDERS = ["man", "woman"]
 GENDER_ETHNICS = [f"{ethnic} {gender}" for ethnic, gender in itertools.product(ETHNICITIES, GENDERS)]
-AGE_GROUPS = [f"{age_range} years old" for age_range in ["15-20", "20-35", "35-50", "50-65", "65-80"]]
+AGE_GROUPS = [f"{age_range} years old" for age_range in ["15-25", "25-45", "45-65", "65-85"]]
 
 PARALLEL_BATCH_SIZE = 5
 
