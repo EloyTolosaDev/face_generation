@@ -88,12 +88,11 @@ def generate_meta_files(config: Config) -> List[Path]:
 
             os.makedirs(meta_dir, exist_ok=True)
 
-            expression_text = [au for au in expression.aus]
-            action_text = ", ".join(expression_text)
+            action_text = ", ".join([au.value for au in expression.aus])
 
             for gender_ethnic, age_group in combinations:
                 demographic_text = f"{gender_ethnic}, {age_group}"
-                prompt = f"{', '.join(expression_text)}, {demographic_text}, {BASE_POSITIVE}"
+                prompt = f"{action_text}, {demographic_text}, {BASE_POSITIVE}"
 
                 for _ in range(config.seeds):
                     seed = base_seed + record_index
