@@ -92,9 +92,9 @@ def generate_meta_files(config: Config) -> List[Path]:
 
             for gender_ethnic, age_group in combinations:
                 demographic_text = f"{gender_ethnic}, {age_group}"
-                prompt = f"DEMOGRAPHICS: {demographic_text}"
-                "ACTION: {action_text}"
-                "BASE: {BASE_POSITIVE}"
+                prompt = f"DEMOGRAPHICS: {demographic_text};" \
+                    f"ACTION: {action_text};" \
+                    f"BASE: {BASE_POSITIVE}"
 
                 for _ in range(config.seeds):
                     seed = base_seed + record_index
