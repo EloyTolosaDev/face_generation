@@ -13,8 +13,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict 
 from pathlib import Path
 from typing import Any, Iterator, List
-from compel import Compel
-from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline, StableDiffusionXLPipeline
+from compel import Compel, ReturnedEmbeddingsType
+from diffusers import DPMSolverMultistepScheduler, StableDiffusionXLPipeline
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
@@ -41,6 +41,7 @@ GENDER_ETHNICS = [f"{ethnic} {gender}" for ethnic, gender in itertools.product(E
 AGE_GROUPS = [f"{age_range} years old" for age_range in ["15-25", "25-45", "45-65", "65-85"]]
 
 PARALLEL_BATCH_SIZE = 5
+JUGGERNAUT_XL_DEFAULT_FILE = "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"
 
 def sanitize_token(value: str) -> str:
     token = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
@@ -159,6 +160,32 @@ _COMPEL: Any = None
 _DEVICE: str = "cpu"
 
 
+def _load_sdxl_pipe(model_id: str, dtype: torch.dtype) -> StableDiffusionXLPipeline:
+    checkpoint_path = Path(model_id).expanduser()
+    if checkpoint_path.is_file():
+        return StableDiffusionXLPipeline.from_single_file(checkpoint_path.as_posix(), torch_dtype=dtype)
+
+    if "::" in model_id:
+        repo_id, filename = model_id.split("::", 1)
+        model_path = hf_hub_download(repo_id.strip(), filename.strip())
+        return StableDiffusionXLPipeline.from_single_file(model_path, torch_dtype=dtype)
+
+    try:
+        return StableDiffusionXLPipeline.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            use_safetensors=True,
+        )
+    except Exception:
+        # Juggernaut XL is commonly distributed as a single-file checkpoint.
+        model_path = hf_hub_download(model_id, JUGGERNAUT_XL_DEFAULT_FILE)
+        return StableDiffusionXLPipeline.from_single_file(model_path, torch_dtype=dtype)
+
+
+def _normalize_sdxl_size(size: int) -> int:
+    return max(64, ((int(size) + 7) // 8) * 8)
+
+
 def _init_image_worker(model_id: str, use_cuda: bool, num_threads: int) -> None:
     global _PIPE, _COMPEL, _DEVICE
 
@@ -167,25 +194,23 @@ def _init_image_worker(model_id: str, use_cuda: bool, num_threads: int) -> None:
 
     if _DEVICE == "cpu":
         torch.set_num_threads(max(1, num_threads))
-    
-    model_path = hf_hub_download(
-        "RunDiffusion/Juggernaut-XL-v9",
-        "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors",
-    )
 
-    pipe = StableDiffusionXLPipeline.from_single_file(
-        model_path,
-        torch_dtype=dtype,
-        # use_safetensors=True,
-        # requires_safety_checker=False,
-    )
+    pipe = _load_sdxl_pipe(model_id, dtype)
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
-    pipe.enable_xformers_memory_efficient_attention()
-    # pipe.enable_model_cpu_offload()
+    if use_cuda:
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
     pipe = pipe.to(_DEVICE)
 
     _PIPE = pipe
-    _COMPEL = Compel(tokenizer=pipe.tokenizer, text_encoder=pipe.text_encoder)
+    _COMPEL = Compel(
+        tokenizer=[pipe.tokenizer, pipe.tokenizer_2],
+        text_encoder=[pipe.text_encoder, pipe.text_encoder_2],
+        returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
+        requires_pooled=[False, True],
+    )
 
 
 def create_image(meta: dict[str, Any]) -> str:
@@ -195,19 +220,25 @@ def create_image(meta: dict[str, Any]) -> str:
     prompt = meta["full_prompt"]
     negative_prompt = meta.get("negative_prompt", BASE_NEGATIVE)
 
-    prompt_embeds = _COMPEL.build_conditioning_tensor(prompt).to(_DEVICE)
-    negative_prompt_embeds = _COMPEL.build_conditioning_tensor(negative_prompt).to(_DEVICE)
+    prompt_embeds, pooled_prompt_embeds = _COMPEL(prompt)
+    negative_prompt_embeds, negative_pooled_prompt_embeds = _COMPEL(negative_prompt)
+    prompt_embeds, negative_prompt_embeds = _COMPEL.pad_conditioning_tensors_to_same_length(
+        [prompt_embeds, negative_prompt_embeds]
+    )
 
     generator = torch.Generator(device=_DEVICE).manual_seed(int(meta["seed"]))
+    img_size = _normalize_sdxl_size(int(meta["img_size"]))
 
     image = _PIPE(
-        prompt_embeds=prompt_embeds,
-        negative_prompt_embeds=negative_prompt_embeds,
+        prompt_embeds=prompt_embeds.to(_DEVICE),
+        pooled_prompt_embeds=pooled_prompt_embeds.to(_DEVICE),
+        negative_prompt_embeds=negative_prompt_embeds.to(_DEVICE),
+        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(_DEVICE),
         num_inference_steps=int(meta["steps"]),
         guidance_scale=float(meta["cfg"]),
         generator=generator,
-        width=int(meta["img_size"]),
-        height=int(meta["img_size"]),
+        width=img_size,
+        height=img_size,
     ).images[0]
 
     image_path = Path(meta["image_path"])
@@ -257,6 +288,11 @@ def render_images_from_meta(meta_paths: List[Path], config: Config) -> None:
     use_cuda = config.gpuOn and torch.cuda.is_available()
     if config.gpuOn and not torch.cuda.is_available():
         print("Config.gpuOn=True but CUDA is not available. Falling back to CPU.")
+    if config.imgSize % 8 != 0:
+        print(
+            f"--image_size {config.imgSize} is not divisible by 8. "
+            f"Using {_normalize_sdxl_size(config.imgSize)} for SDXL rendering."
+        )
 
     ctx = mp.get_context("spawn")
     rendered_images = 0
