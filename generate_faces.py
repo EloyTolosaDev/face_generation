@@ -88,7 +88,7 @@ def generate_meta_files(config: Config) -> List[Path]:
 
             os.makedirs(meta_dir, exist_ok=True)
 
-            expression_text = [au*intensity for au, intensity in expression.config.items()]
+            expression_text = [au for au in expression.aus]
             action_text = ", ".join(expression_text)
 
             for gender_ethnic, age_group in combinations:
@@ -117,7 +117,7 @@ def generate_meta_files(config: Config) -> List[Path]:
                         "steps": config.steps,
                         "cfg": config.cfg,
                         "model_id": config.modelId,
-                        "au_recipe": [(au.id, intensity) for au, intensity in expression.config.items()],
+                        "au_recipe": [ au.name for au in expression.aus],
                         "au_action_text": action_text,
                         "base_positive": BASE_POSITIVE,
                         "negative_prompt": BASE_NEGATIVE,

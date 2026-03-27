@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import List
-from au import ActionUnit, ACTION_UNITS as aus
+from au import ActionUnits as aus
 
 # ---------------------------------------
 # 4) Expression definitions
@@ -8,15 +8,13 @@ from au import ActionUnit, ACTION_UNITS as aus
 @dataclass
 class Expression:
     name: str
-    config: dict[ActionUnit, float]
+    aus: List[aus]
+
 
 EXPRESSIONS: List[Expression] = [
-    Expression("simple:smile", {
-        aus[1]: 1.7, aus[6]: 1.4, aus[25]: 1.1
-    }),
-    Expression("mad", {
-        aus[4]: 1.7, aus[7]: 1.1, aus[24]: 1.4, aus[23]: 1.4
-    })
+    Expression(
+        "mad", [aus.AU4_HIGH, aus.AU7_MEDIUM, aus.AU24_HIGH, aus.AU23_MEDIUM]
+    )
 ]
 
 # EXPRESSIONS: List[ExpressionSpec] = [
