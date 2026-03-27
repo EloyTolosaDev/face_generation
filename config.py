@@ -32,18 +32,17 @@ class Config:
         p.add_argument(
             "--model_id",
             type=str,
-            default="emilianJR/epiCRealism",
+            default="RunDiffusion/Juggernaut-XL-v9",
             help="Model checkpoint to generate images from.",
         )
         p.add_argument(
             "--output",
             type=Path,
-            required=True,
             help="Output directory for generated files (for example: ./suites)",
         )
-        p.add_argument("--image_size", type=int, default=512)
+        p.add_argument("--image_size", type=int, default=1024)
         p.add_argument("--steps", type=int, default=20)
-        p.add_argument("--cfg", type=float, default=5.0)
+        p.add_argument("--cfg", type=float, default=3.0)
         p.add_argument(
             "--seeds",
             type=int,

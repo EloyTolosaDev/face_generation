@@ -1,4 +1,3 @@
-import argparse
 import itertools
 import json
 import multiprocessing as mp
@@ -7,8 +6,7 @@ import re
 import time
 import torch
 
-from expression_spec import EXPRESSIONS, ExpressionSpec
-from au import ACTION_UNITS
+from expression_spec import EXPRESSIONS, Expression
 from config import Config
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -16,14 +14,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterator, List
 from compel import Compel
-from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
+from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline, StableDiffusionXLPipeline
+from huggingface_hub import hf_hub_download
 from tqdm import tqdm
-
-def validate_expression_aus(expressions: List[ExpressionSpec]) -> None:
-    unknown_aus = sorted({au for spec in expressions for au in spec.aus if au not in ACTION_UNITS})
-    if unknown_aus:
-        raise ValueError(f"Unknown AU ids referenced by expressions: {unknown_aus}")
-
 
 # ---------------------------------------
 # 5) Prompt templates
@@ -49,10 +42,6 @@ AGE_GROUPS = [f"{age_range} years old" for age_range in ["15-25", "25-45", "45-6
 
 PARALLEL_BATCH_SIZE = 5
 
-
-
-
-
 def sanitize_token(value: str) -> str:
     token = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
     return token or "item"
@@ -62,14 +51,13 @@ def get_combinations() -> List[tuple[str, str]]:
     return list(itertools.product(GENDER_ETHNICS, AGE_GROUPS))
 
 
-def get_selected_expressions(requested_names: List[str]) -> List[ExpressionSpec]:
-    validate_expression_aus(EXPRESSIONS)
+def get_selected_expressions(requested_names: List[str]) -> List[Expression]:
 
     if not requested_names:
         return EXPRESSIONS
 
     requested = set(requested_names)
-    selected = [spec for spec in EXPRESSIONS if spec.name in requested]
+    selected = [expression for expression in EXPRESSIONS if expression.name in requested]
     if not selected:
         raise ValueError(f"No expressions matched --expressions: {requested_names}")
     return selected
@@ -91,20 +79,20 @@ def generate_meta_files(config: Config) -> List[Path]:
     record_index = 0
 
     with tqdm(total=total_meta, desc="Phase 1/2 - Writing meta", unit="meta") as pbar:
-        for spec in selected_expressions:
+        for expression in selected_expressions:
 
             ## create dir where meta for each expression will live
-            meta_dir = config.outDir / sanitize_token(spec.name) / "meta"
-            images_dir = config.outDir / sanitize_token(spec.name) / "images"
+            meta_dir = config.outDir / sanitize_token(expression.name) / "meta"
+            images_dir = config.outDir / sanitize_token(expression.name) / "images"
 
             os.makedirs(meta_dir, exist_ok=True)
 
-            weighted_phrases = [ACTION_UNITS[au] * strength for au, strength in spec.aus.items()]
-            action_text = ", ".join(p.replace("(", "").replace(")", "") for p in weighted_phrases)
+            expression_text = [au*intensity for au, intensity in expression.config.items()]
+            action_text = ", ".join(expression_text)
 
             for gender_ethnic, age_group in combinations:
                 demographic_text = f"{gender_ethnic}, {age_group}"
-                prompt = f"{', '.join(weighted_phrases)}, {demographic_text}, {BASE_POSITIVE}"
+                prompt = f"{', '.join(expression_text)}, {demographic_text}, {BASE_POSITIVE}"
 
                 for _ in range(config.seeds):
                     seed = base_seed + record_index
@@ -112,7 +100,7 @@ def generate_meta_files(config: Config) -> List[Path]:
 
                     image_stem = "_".join(
                         [
-                            sanitize_token(spec.name),
+                            sanitize_token(expression.name),
                             sanitize_token(gender_ethnic),
                             sanitize_token(age_group),
                             str(seed),
@@ -122,13 +110,13 @@ def generate_meta_files(config: Config) -> List[Path]:
                     meta_path = meta_dir / f"{image_stem}.json"
 
                     meta = {
-                        "expression": spec.name,
+                        "expression": expression.name,
                         "seed": seed,
                         "img_size": config.imgSize,
                         "steps": config.steps,
                         "cfg": config.cfg,
                         "model_id": config.modelId,
-                        "au_recipe": spec.aus,
+                        "au_recipe": [(au.id, intensity) for au, intensity in expression.config.items()],
                         "au_action_text": action_text,
                         "base_positive": BASE_POSITIVE,
                         "negative_prompt": BASE_NEGATIVE,
@@ -179,14 +167,21 @@ def _init_image_worker(model_id: str, use_cuda: bool, num_threads: int) -> None:
 
     if _DEVICE == "cpu":
         torch.set_num_threads(max(1, num_threads))
+    
+    model_path = hf_hub_download(
+        "RunDiffusion/Juggernaut-XL-v9",
+        "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors",
+    )
 
-    pipe = StableDiffusionPipeline.from_pretrained(
-        model_id,
+    pipe = StableDiffusionXLPipeline.from_single_file(
+        model_path,
         torch_dtype=dtype,
-        safety_checker=None,
-        requires_safety_checker=False,
+        # use_safetensors=True,
+        # requires_safety_checker=False,
     )
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe.enable_xformers_memory_efficient_attention()
+    # pipe.enable_model_cpu_offload()
     pipe = pipe.to(_DEVICE)
 
     _PIPE = pipe
@@ -317,7 +312,7 @@ def main(config: Config) -> None:
 
     if not config.onlyMeta: 
         render_images_from_meta(meta_paths, config)
-        print(f"Done. See: {config.outDir.as_posix()}/")
+        print(f"Done.")
 
 
 if __name__ == "__main__":
