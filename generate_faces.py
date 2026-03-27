@@ -38,7 +38,7 @@ BASE_NEGATIVE = (
 ETHNICITIES = ["white", "asian", "black", "hispanic", "hawaiian", "alaskan-native"]
 GENDERS = ["man", "woman"]
 GENDER_ETHNICS = [f"{ethnic} {gender}" for ethnic, gender in itertools.product(ETHNICITIES, GENDERS)]
-AGE_GROUPS = [f"{age_range} years old" for age_range in ["15-25", "25-45", "45-65", "65-85"]]
+AGE_GROUPS = [f"between {low} and {high} years old" for low, high in [(15,25), (25,45), (45,65), (65,85)]]
 
 PARALLEL_BATCH_SIZE = 5
 JUGGERNAUT_XL_DEFAULT_FILE = "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"
@@ -92,7 +92,9 @@ def generate_meta_files(config: Config) -> List[Path]:
 
             for gender_ethnic, age_group in combinations:
                 demographic_text = f"{gender_ethnic}, {age_group}"
-                prompt = f"{action_text}, {demographic_text}, {BASE_POSITIVE}"
+                prompt = f"DEMOGRAPHICS: {demographic_text}"
+                "ACTION: {action_text}"
+                "BASE: {BASE_POSITIVE}"
 
                 for _ in range(config.seeds):
                     seed = base_seed + record_index
