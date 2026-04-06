@@ -209,3 +209,4 @@ __marimo__/
 # ==== CUSTOM
 # suites folder is where image generation suites are generated locally
 suites
+*codex

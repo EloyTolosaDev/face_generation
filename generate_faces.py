@@ -23,13 +23,15 @@ from tqdm import tqdm
 # 5) Prompt templates
 # ---------------------------------------
 BASE_POSITIVE = (
-    "photorealistic portrait photo, headshot, looking at camera, "
-    "neutral studio lighting, neutral background, realistic skin texture, sharp focus, 85mm lens"
+    "photorealistic studio portrait photo, head-and-shoulders framing, face fully visible and centered, "
+    "looking at camera, neutral studio lighting, neutral background, realistic skin texture, sharp focus, "
+    "85mm lens, natural facial proportions"
 )
 
 BASE_NEGATIVE = (
     "blurry, low quality, deformed, asymmetry, extra teeth, "
-    "watermark, text, cartoon, cgi, illustration"
+    "watermark, text, cartoon, cgi, illustration, extreme close-up, face crop, cropped forehead, "
+    "cropped chin, wide-angle distortion, fisheye distortion, exaggerated facial proportions"
 )
 
 
@@ -66,17 +68,23 @@ def get_selected_expressions(requested_names: List[str]) -> List[Expression]:
 
 
 def compose_negative_prompt(base_negative: str, au_negative: str) -> str:
-    """Append AU-specific negatives without duplicating the same AU block."""
-    base_negative = (base_negative or "").strip()
-    au_negative = (au_negative or "").strip()
-
-    if not au_negative:
-        return base_negative
-    if not base_negative:
-        return au_negative
-    if au_negative in base_negative:
-        return base_negative
-    return f"{base_negative}, {au_negative}"
+    """
+    Merge comma-separated prompt fragments while preserving order and removing duplicates.
+    BASE negatives must always be present; AU negatives are appended as extra constraints.
+    """
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for fragment in [base_negative, au_negative]:
+        for raw_token in str(fragment or "").split(","):
+            token = raw_token.strip()
+            if not token:
+                continue
+            key = token.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            tokens.append(token)
+    return ", ".join(tokens)
 
 
 def compose_positive_prompt(demographic_text: str, action_text: str, base_positive: str) -> str:
@@ -339,6 +347,15 @@ def load_render_meta(meta_path: Path, config: Config) -> dict[str, Any]:
     with meta_path.open("r", encoding="utf-8") as f:
         meta = json.load(f)
 
+    # Backward compatibility: keep expression/action identity from meta, but refresh
+    # old base framing wording so legacy meta runs get consistent studio framing.
+    stored_base_positive = str(meta.get("base_positive", "")).strip()
+    if stored_base_positive:
+        full_prompt = str(meta.get("full_prompt", ""))
+        if full_prompt and stored_base_positive in full_prompt:
+            meta["full_prompt"] = full_prompt.replace(stored_base_positive, BASE_POSITIVE)
+    meta["base_positive"] = BASE_POSITIVE
+
     # When rendering from meta, keep identity from meta (prompt/seed/expression),
     # but allow these runtime quality controls from CLI config.
     normalized_au_recipe, au_recipe_weights = normalize_au_recipe(meta.get("au_recipe", []))
@@ -346,12 +363,13 @@ def load_render_meta(meta_path: Path, config: Config) -> dict[str, Any]:
     if au_recipe_weights:
         meta["au_recipe_weights"] = au_recipe_weights
 
-    existing_negative_prompt = str(meta.get("negative_prompt", BASE_NEGATIVE))
+    existing_negative_prompt = str(meta.get("negative_prompt", "")).strip()
     au_negative_text = str(meta.get("au_negative_text", "")).strip()
     if not au_negative_text:
         au_negative_text = get_au_negative_prompt_from_names(normalized_au_recipe)
     meta["au_negative_text"] = au_negative_text
-    meta["negative_prompt"] = compose_negative_prompt(existing_negative_prompt, au_negative_text)
+    base_plus_existing_negative = compose_negative_prompt(BASE_NEGATIVE, existing_negative_prompt)
+    meta["negative_prompt"] = compose_negative_prompt(base_plus_existing_negative, au_negative_text)
     meta["img_size"] = config.imgSize
     meta["steps"] = config.steps
     meta["cfg"] = config.cfg
