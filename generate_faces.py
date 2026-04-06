@@ -23,15 +23,16 @@ from tqdm import tqdm
 # 5) Prompt templates
 # ---------------------------------------
 BASE_POSITIVE = (
-    "photorealistic studio portrait photo, head-and-shoulders framing, face fully visible and centered, "
-    "looking at camera, neutral studio lighting, neutral background, realistic skin texture, sharp focus, "
-    "85mm lens, natural facial proportions"
+    "photorealistic studio portrait photo, headshot, comfortable camera distance, entire head visible, "
+    "small space above hair, centered composition, looking at camera, neutral studio lighting, "
+    "neutral background, realistic skin texture, sharp focus, 85mm lens, natural facial proportions"
 )
 
 BASE_NEGATIVE = (
     "blurry, low quality, deformed, asymmetry, extra teeth, "
-    "watermark, text, cartoon, cgi, illustration, extreme close-up, face crop, cropped forehead, "
-    "cropped chin, wide-angle distortion, fisheye distortion, exaggerated facial proportions"
+    "watermark, text, cartoon, cgi, illustration, extreme close-up, tightly cropped face, "
+    "face filling frame, cropped forehead, cropped chin, wide-angle distortion, "
+    "fisheye distortion, exaggerated facial proportions"
 )
 
 
@@ -89,7 +90,7 @@ def compose_negative_prompt(base_negative: str, au_negative: str) -> str:
 
 def compose_positive_prompt(demographic_text: str, action_text: str, base_positive: str) -> str:
     """Compose a natural-language prompt for SDXL text encoders."""
-    return f"{demographic_text}, {action_text}, {base_positive}"
+    return f"{demographic_text}, {base_positive}, facial expression details: {action_text}"
 
 
 def _normalize_au_token(raw_token: Any) -> str:
