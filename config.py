@@ -22,6 +22,7 @@ class Config:
     singleStep: bool
     stage1Steps: int
     stage1Cfg: float
+    stage2Cfg: Optional[float]
     stage2Strength: float
     
     ## default values
@@ -99,6 +100,11 @@ class Config:
             help="Step 1 (structure pass) CFG for two-step generation.",
         )
         p.add_argument(
+            "--stage2_cfg",
+            type=float,
+            help="Step 2 (expression refinement pass) CFG for two-step generation. Defaults to --cfg.",
+        )
+        p.add_argument(
             "--stage2_strength",
             type=float,
             default=0.35,
@@ -123,5 +129,6 @@ class Config:
             singleStep=args.single_step,
             stage1Steps=args.stage1_steps,
             stage1Cfg=args.stage1_cfg,
+            stage2Cfg=args.stage2_cfg,
             stage2Strength=args.stage2_strength,
         )
