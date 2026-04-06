@@ -8,6 +8,7 @@ import torch
 
 from expression_spec import EXPRESSIONS, Expression
 from config import Config
+from au import get_au_negative_prompt, get_au_negative_prompt_from_names
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict 
@@ -64,6 +65,71 @@ def get_selected_expressions(requested_names: List[str]) -> List[Expression]:
     return selected
 
 
+def compose_negative_prompt(base_negative: str, au_negative: str) -> str:
+    """Append AU-specific negatives without duplicating the same AU block."""
+    base_negative = (base_negative or "").strip()
+    au_negative = (au_negative or "").strip()
+
+    if not au_negative:
+        return base_negative
+    if not base_negative:
+        return au_negative
+    if au_negative in base_negative:
+        return base_negative
+    return f"{base_negative}, {au_negative}"
+
+
+def compose_positive_prompt(demographic_text: str, action_text: str, base_positive: str) -> str:
+    """Compose a natural-language prompt for SDXL text encoders."""
+    return f"{demographic_text}, {action_text}, {base_positive}"
+
+
+def _normalize_au_token(raw_token: Any) -> str:
+    token = str(raw_token).strip().upper()
+    if not token:
+        return ""
+    if token.isdigit():
+        return f"AU{token}"
+    return token
+
+
+def normalize_au_recipe(au_recipe: Any) -> tuple[list[str], dict[str, float]]:
+    """
+    Normalize historical and current AU schemas to a consistent format.
+    - list schema (current): ["AU4_HIGH", "AU7_MEDIUM"]
+    - dict schema (legacy): {"4": 0.3, "15": 0.9}
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    weights: dict[str, float] = {}
+
+    if isinstance(au_recipe, list):
+        items = au_recipe
+    elif isinstance(au_recipe, dict):
+        items = list(au_recipe.keys())
+    else:
+        items = []
+
+    for raw in items:
+        token = _normalize_au_token(raw)
+        if not token or token in seen:
+            continue
+        names.append(token)
+        seen.add(token)
+
+    if isinstance(au_recipe, dict):
+        for raw_key, raw_weight in au_recipe.items():
+            token = _normalize_au_token(raw_key)
+            if not token:
+                continue
+            try:
+                weights[token] = float(raw_weight)
+            except (TypeError, ValueError):
+                continue
+
+    return names, weights
+
+
 # ---------------------------------------
 # Phase 1: generate prompt + meta files
 # ---------------------------------------
@@ -89,12 +155,12 @@ def generate_meta_files(config: Config) -> List[Path]:
             os.makedirs(meta_dir, exist_ok=True)
 
             action_text = ", ".join([au.value for au in expression.aus])
+            au_negative_text = get_au_negative_prompt(expression.aus)
+            negative_prompt = compose_negative_prompt(BASE_NEGATIVE, au_negative_text)
 
             for gender_ethnic, age_group in combinations:
                 demographic_text = f"{gender_ethnic}, {age_group}"
-                prompt = f"DEMOGRAPHICS: {demographic_text};" \
-                    f"ACTION: {action_text};" \
-                    f"BASE: {BASE_POSITIVE}"
+                prompt = compose_positive_prompt(demographic_text, action_text, BASE_POSITIVE)
 
                 for _ in range(config.seeds):
                     seed = base_seed + record_index
@@ -120,8 +186,9 @@ def generate_meta_files(config: Config) -> List[Path]:
                         "model_id": config.modelId,
                         "au_recipe": [ au.name for au in expression.aus],
                         "au_action_text": action_text,
+                        "au_negative_text": au_negative_text,
                         "base_positive": BASE_POSITIVE,
-                        "negative_prompt": BASE_NEGATIVE,
+                        "negative_prompt": negative_prompt,
                         "full_prompt": prompt,
                         "gender_ethnic": gender_ethnic,
                         "age_group": age_group,
@@ -274,6 +341,17 @@ def load_render_meta(meta_path: Path, config: Config) -> dict[str, Any]:
 
     # When rendering from meta, keep identity from meta (prompt/seed/expression),
     # but allow these runtime quality controls from CLI config.
+    normalized_au_recipe, au_recipe_weights = normalize_au_recipe(meta.get("au_recipe", []))
+    meta["au_recipe"] = normalized_au_recipe
+    if au_recipe_weights:
+        meta["au_recipe_weights"] = au_recipe_weights
+
+    existing_negative_prompt = str(meta.get("negative_prompt", BASE_NEGATIVE))
+    au_negative_text = str(meta.get("au_negative_text", "")).strip()
+    if not au_negative_text:
+        au_negative_text = get_au_negative_prompt_from_names(normalized_au_recipe)
+    meta["au_negative_text"] = au_negative_text
+    meta["negative_prompt"] = compose_negative_prompt(existing_negative_prompt, au_negative_text)
     meta["img_size"] = config.imgSize
     meta["steps"] = config.steps
     meta["cfg"] = config.cfg
