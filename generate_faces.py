@@ -35,6 +35,10 @@ BASE_NEGATIVE = (
     "fisheye distortion, exaggerated facial proportions"
 )
 
+STRUCTURE_POSITIVE_SUFFIX = (
+    "neutral expression, relaxed facial muscles, mouth gently closed, natural brow position"
+)
+
 
 # --------------------------------------
 # 6) Gender, race, age
@@ -91,6 +95,11 @@ def compose_negative_prompt(base_negative: str, au_negative: str) -> str:
 def compose_positive_prompt(demographic_text: str, action_text: str, base_positive: str) -> str:
     """Compose a natural-language prompt for SDXL text encoders."""
     return f"{demographic_text}, {base_positive}, facial expression details: {action_text}"
+
+
+def compose_structure_prompt(demographic_text: str, base_positive: str) -> str:
+    """Compose step-1 prompt focused on stable framing/proportions."""
+    return f"{demographic_text}, {base_positive}, {STRUCTURE_POSITIVE_SUFFIX}"
 
 
 def _normalize_au_token(raw_token: Any) -> str:
@@ -166,10 +175,13 @@ def generate_meta_files(config: Config) -> List[Path]:
             action_text = ", ".join([au.value for au in expression.aus])
             au_negative_text = get_au_negative_prompt(expression.aus)
             negative_prompt = compose_negative_prompt(BASE_NEGATIVE, au_negative_text)
+            two_step_enabled = not config.singleStep
 
             for gender_ethnic, age_group in combinations:
                 demographic_text = f"{gender_ethnic}, {age_group}"
                 prompt = compose_positive_prompt(demographic_text, action_text, BASE_POSITIVE)
+                stage1_prompt = compose_structure_prompt(demographic_text, BASE_POSITIVE)
+                stage1_negative_prompt = BASE_NEGATIVE
 
                 for _ in range(config.seeds):
                     seed = base_seed + record_index
@@ -199,6 +211,12 @@ def generate_meta_files(config: Config) -> List[Path]:
                         "base_positive": BASE_POSITIVE,
                         "negative_prompt": negative_prompt,
                         "full_prompt": prompt,
+                        "two_step_enabled": two_step_enabled,
+                        "stage1_prompt": stage1_prompt,
+                        "stage1_negative_prompt": stage1_negative_prompt,
+                        "stage1_steps": max(1, int(config.stage1Steps)),
+                        "stage1_cfg": float(config.stage1Cfg),
+                        "stage2_strength": max(0.0, min(1.0, float(config.stage2Strength))),
                         "gender_ethnic": gender_ethnic,
                         "age_group": age_group,
                         "image_path": image_path.as_posix(),
@@ -290,33 +308,106 @@ def _init_image_worker(model_id: str, use_cuda: bool, num_threads: int) -> None:
     )
 
 
-def create_image(meta: dict[str, Any]) -> str:
-    if _PIPE is None or _COMPEL is None:
-        raise RuntimeError("Image worker is not initialized")
-
-    prompt = meta["full_prompt"]
-    negative_prompt = meta.get("negative_prompt", BASE_NEGATIVE)
-
+def _build_conditioning(prompt: str, negative_prompt: str) -> tuple[Any, Any, Any, Any]:
     prompt_embeds, pooled_prompt_embeds = _COMPEL(prompt)
     negative_prompt_embeds, negative_pooled_prompt_embeds = _COMPEL(negative_prompt)
     prompt_embeds, negative_prompt_embeds = _COMPEL.pad_conditioning_tensors_to_same_length(
         [prompt_embeds, negative_prompt_embeds]
     )
+    return (
+        prompt_embeds.to(_DEVICE),
+        pooled_prompt_embeds.to(_DEVICE),
+        negative_prompt_embeds.to(_DEVICE),
+        negative_pooled_prompt_embeds.to(_DEVICE),
+    )
 
-    generator = torch.Generator(device=_DEVICE).manual_seed(int(meta["seed"]))
-    img_size = _normalize_sdxl_size(int(meta["img_size"]))
 
-    image = _PIPE(
-        prompt_embeds=prompt_embeds.to(_DEVICE),
-        pooled_prompt_embeds=pooled_prompt_embeds.to(_DEVICE),
-        negative_prompt_embeds=negative_prompt_embeds.to(_DEVICE),
-        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(_DEVICE),
+def _render_single_step(meta: dict[str, Any], img_size: int, seed: int) -> Any:
+    prompt = str(meta["full_prompt"])
+    negative_prompt = str(meta.get("negative_prompt", BASE_NEGATIVE))
+    (
+        prompt_embeds,
+        pooled_prompt_embeds,
+        negative_prompt_embeds,
+        negative_pooled_prompt_embeds,
+    ) = _build_conditioning(prompt, negative_prompt)
+
+    generator = torch.Generator(device=_DEVICE).manual_seed(seed)
+    return _PIPE(
+        prompt_embeds=prompt_embeds,
+        pooled_prompt_embeds=pooled_prompt_embeds,
+        negative_prompt_embeds=negative_prompt_embeds,
+        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
         num_inference_steps=int(meta["steps"]),
         guidance_scale=float(meta["cfg"]),
         generator=generator,
         width=img_size,
         height=img_size,
     ).images[0]
+
+
+def _render_two_step(meta: dict[str, Any], img_size: int, seed: int) -> Any:
+    stage1_prompt = str(meta.get("stage1_prompt") or meta["full_prompt"])
+    stage1_negative_prompt = str(meta.get("stage1_negative_prompt") or BASE_NEGATIVE)
+    stage1_steps = max(1, int(meta.get("stage1_steps", meta["steps"])))
+    stage1_cfg = float(meta.get("stage1_cfg", meta["cfg"]))
+    stage2_strength = max(0.0, min(1.0, float(meta.get("stage2_strength", 0.35))))
+
+    # Step 1: stabilize composition/identity.
+    (
+        stage1_prompt_embeds,
+        stage1_pooled_prompt_embeds,
+        stage1_negative_prompt_embeds,
+        stage1_negative_pooled_prompt_embeds,
+    ) = _build_conditioning(stage1_prompt, stage1_negative_prompt)
+    generator_stage1 = torch.Generator(device=_DEVICE).manual_seed(seed)
+    base_image = _PIPE(
+        prompt_embeds=stage1_prompt_embeds,
+        pooled_prompt_embeds=stage1_pooled_prompt_embeds,
+        negative_prompt_embeds=stage1_negative_prompt_embeds,
+        negative_pooled_prompt_embeds=stage1_negative_pooled_prompt_embeds,
+        num_inference_steps=stage1_steps,
+        guidance_scale=stage1_cfg,
+        generator=generator_stage1,
+        width=img_size,
+        height=img_size,
+    ).images[0]
+
+    # Step 2: apply AU-driven expression refinements on top of the base portrait.
+    stage2_prompt = str(meta["full_prompt"])
+    stage2_negative_prompt = str(meta.get("negative_prompt", BASE_NEGATIVE))
+    (
+        stage2_prompt_embeds,
+        stage2_pooled_prompt_embeds,
+        stage2_negative_prompt_embeds,
+        stage2_negative_pooled_prompt_embeds,
+    ) = _build_conditioning(stage2_prompt, stage2_negative_prompt)
+    generator_stage2 = torch.Generator(device=_DEVICE).manual_seed(seed + 1)
+    return _PIPE(
+        image=base_image,
+        strength=stage2_strength,
+        prompt_embeds=stage2_prompt_embeds,
+        pooled_prompt_embeds=stage2_pooled_prompt_embeds,
+        negative_prompt_embeds=stage2_negative_prompt_embeds,
+        negative_pooled_prompt_embeds=stage2_negative_pooled_prompt_embeds,
+        num_inference_steps=int(meta["steps"]),
+        guidance_scale=float(meta["cfg"]),
+        generator=generator_stage2,
+    ).images[0]
+
+
+def create_image(meta: dict[str, Any]) -> str:
+    if _PIPE is None or _COMPEL is None:
+        raise RuntimeError("Image worker is not initialized")
+
+    seed = int(meta["seed"])
+    img_size = _normalize_sdxl_size(int(meta["img_size"]))
+    two_step_enabled = bool(meta.get("two_step_enabled", True))
+    stage2_strength = max(0.0, min(1.0, float(meta.get("stage2_strength", 0.35))))
+    if two_step_enabled and stage2_strength > 0.0:
+        image = _render_two_step(meta, img_size, seed)
+    else:
+        image = _render_single_step(meta, img_size, seed)
 
     image_path = Path(meta["image_path"])
     image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -356,6 +447,20 @@ def load_render_meta(meta_path: Path, config: Config) -> dict[str, Any]:
         if full_prompt and stored_base_positive in full_prompt:
             meta["full_prompt"] = full_prompt.replace(stored_base_positive, BASE_POSITIVE)
     meta["base_positive"] = BASE_POSITIVE
+
+    gender_ethnic = str(meta.get("gender_ethnic", "")).strip()
+    age_group = str(meta.get("age_group", "")).strip()
+    demographic_text = f"{gender_ethnic}, {age_group}".strip(", ").strip()
+    default_stage1_prompt = compose_structure_prompt(demographic_text, BASE_POSITIVE) if demographic_text else str(meta.get("full_prompt", ""))
+    stage1_prompt = str(meta.get("stage1_prompt", default_stage1_prompt)).strip()
+    meta["stage1_prompt"] = stage1_prompt or default_stage1_prompt
+    meta["stage1_negative_prompt"] = compose_negative_prompt(
+        BASE_NEGATIVE, str(meta.get("stage1_negative_prompt", "")).strip()
+    )
+    meta["two_step_enabled"] = not config.singleStep
+    meta["stage1_steps"] = max(1, int(config.stage1Steps))
+    meta["stage1_cfg"] = float(config.stage1Cfg)
+    meta["stage2_strength"] = max(0.0, min(1.0, float(config.stage2Strength)))
 
     # When rendering from meta, keep identity from meta (prompt/seed/expression),
     # but allow these runtime quality controls from CLI config.

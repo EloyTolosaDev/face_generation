@@ -19,6 +19,10 @@ class Config:
     parallelBatchSize: int
     onlyMeta: bool
     fromMeta: Optional[Path]
+    singleStep: bool
+    stage1Steps: int
+    stage1Cfg: float
+    stage2Strength: float
     
     ## default values
     _default_parallel_batch_size: ClassVar[int] = 5
@@ -76,6 +80,30 @@ class Config:
             help="Only meta means only generate json files needed to generate the images. By default, meta AND images are generated"
         )
         p.add_argument("--from_meta", type=Path, help="Only generate images from meta-files from a path where meta-files are on")
+        p.add_argument(
+            "--single_step",
+            default=False,
+            action="store_true",
+            help="Disable two-step generation and run only text-to-image.",
+        )
+        p.add_argument(
+            "--stage1_steps",
+            type=int,
+            default=16,
+            help="Step 1 (structure pass) denoising steps for two-step generation.",
+        )
+        p.add_argument(
+            "--stage1_cfg",
+            type=float,
+            default=3.0,
+            help="Step 1 (structure pass) CFG for two-step generation.",
+        )
+        p.add_argument(
+            "--stage2_strength",
+            type=float,
+            default=0.35,
+            help="Step 2 img2img strength in two-step generation (0.0-1.0).",
+        )
 
         args = p.parse_args()
         return cls(
@@ -92,4 +120,8 @@ class Config:
             parallelBatchSize=args.parallel_batch_size,
             onlyMeta=args.only_meta,
             fromMeta=args.from_meta,
+            singleStep=args.single_step,
+            stage1Steps=args.stage1_steps,
+            stage1Cfg=args.stage1_cfg,
+            stage2Strength=args.stage2_strength,
         )
