@@ -216,6 +216,7 @@ def generate_meta_files(config: Config) -> List[Path]:
                         "stage1_negative_prompt": stage1_negative_prompt,
                         "stage1_steps": max(1, int(config.stage1Steps)),
                         "stage1_cfg": float(config.stage1Cfg),
+                        "stage2_cfg": float(config.stage2Cfg) if config.stage2Cfg is not None else float(config.cfg),
                         "stage2_strength": max(0.0, min(1.0, float(config.stage2Strength))),
                         "gender_ethnic": gender_ethnic,
                         "age_group": age_group,
@@ -351,6 +352,7 @@ def _render_two_step(meta: dict[str, Any], img_size: int, seed: int) -> Any:
     stage1_negative_prompt = str(meta.get("stage1_negative_prompt") or BASE_NEGATIVE)
     stage1_steps = max(1, int(meta.get("stage1_steps", meta["steps"])))
     stage1_cfg = float(meta.get("stage1_cfg", meta["cfg"]))
+    stage2_cfg = float(meta.get("stage2_cfg", meta["cfg"]))
     stage2_strength = max(0.0, min(1.0, float(meta.get("stage2_strength", 0.35))))
 
     # Step 1: stabilize composition/identity.
@@ -391,7 +393,7 @@ def _render_two_step(meta: dict[str, Any], img_size: int, seed: int) -> Any:
         negative_prompt_embeds=stage2_negative_prompt_embeds,
         negative_pooled_prompt_embeds=stage2_negative_pooled_prompt_embeds,
         num_inference_steps=int(meta["steps"]),
-        guidance_scale=float(meta["cfg"]),
+        guidance_scale=stage2_cfg,
         generator=generator_stage2,
     ).images[0]
 
@@ -460,6 +462,7 @@ def load_render_meta(meta_path: Path, config: Config) -> dict[str, Any]:
     meta["two_step_enabled"] = not config.singleStep
     meta["stage1_steps"] = max(1, int(config.stage1Steps))
     meta["stage1_cfg"] = float(config.stage1Cfg)
+    meta["stage2_cfg"] = float(config.stage2Cfg) if config.stage2Cfg is not None else float(config.cfg)
     meta["stage2_strength"] = max(0.0, min(1.0, float(config.stage2Strength)))
 
     # When rendering from meta, keep identity from meta (prompt/seed/expression),
