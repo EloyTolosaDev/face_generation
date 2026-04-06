@@ -36,7 +36,7 @@ BASE_NEGATIVE = (
 )
 
 STRUCTURE_POSITIVE_SUFFIX = (
-    "neutral expression, relaxed facial muscles, mouth gently closed, natural brow position"
+    "stable head pose, balanced facial proportions, clean studio framing"
 )
 
 
