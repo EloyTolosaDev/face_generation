@@ -9,11 +9,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from diffusers import (
     ControlNetModel,
     DPMSolverMultistepScheduler,
-    StableDiffusionXLControlNetImg2ImgPipeline,
+    StableDiffusionXLControlNetInpaintPipeline,
 )
 from huggingface_hub import hf_hub_download
 
@@ -28,7 +28,7 @@ JUGGERNAUT_XL_DEFAULT_FILE = "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"
 
 STEPS = 24
 CFG = 3.8
-IMG2IMG_STRENGTH = 0.35
+INPAINT_STRENGTH = 0.35
 CONTROLNET_SCALE = 1.2
 
 BASE_POSITIVE = (
@@ -40,6 +40,7 @@ BASE_NEGATIVE = (
 )
 
 OUTPUT_ROOT = Path("./suites/au_apply")
+INPAINT_BASE_FALLBACK_MODEL_ID = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
 
 
 # ---------------------------------------
@@ -95,6 +96,23 @@ AU_TEXT: Dict[str, str] = {
     "AU24": "lips pressed",
 }
 
+# OpenPose face landmark topology regions (68-point convention).
+FACE_REGIONS: Dict[str, List[int]] = {
+    "brows": list(range(17, 27)),
+    "left_eye": list(range(36, 42)),
+    "right_eye": list(range(42, 48)),
+    "outer_mouth": list(range(48, 60)),
+    "inner_mouth": list(range(60, 68)),
+}
+
+# Which regions should be editable per AU.
+AU_TO_MASK_REGIONS: Dict[str, List[str]] = {
+    "AU4": ["brows"],
+    "AU7": ["left_eye", "right_eye"],
+    "AU23": ["outer_mouth", "inner_mouth"],
+    "AU24": ["outer_mouth", "inner_mouth"],
+}
+
 
 @dataclass
 class ParsedAU:
@@ -143,11 +161,12 @@ def parse_au_token(token: str) -> ParsedAU:
 
 def load_openpose_backend() -> Tuple[Any, Any]:
     try:
-        from controlnet_aux import OpenposeDetector
+        from controlnet_aux.open_pose import OpenposeDetector
         from controlnet_aux.open_pose import draw_poses
     except Exception as exc:
         raise RuntimeError(
-            "OpenPose backend is required. Install with: pip install controlnet_aux opencv-python"
+            "OpenPose backend is required. Install with: pip install controlnet_aux opencv-python. "
+            f"Original import error: {exc}"
         ) from exc
 
     detector = OpenposeDetector.from_pretrained(OPENPOSE_ANNOTATORS_REPO)
@@ -307,13 +326,68 @@ def build_prompt(au_list: List[ParsedAU]) -> str:
     return f"{BASE_POSITIVE}, facial expression details: {details}"
 
 
-def load_pipeline(use_cuda: bool) -> StableDiffusionXLControlNetImg2ImgPipeline:
+def build_inpaint_mask(face_points: List[Optional[Tuple[float, float]]], au_list: List[ParsedAU], size: int) -> Image.Image:
+    mask = Image.new("L", (size, size), 0)
+    draw = ImageDraw.Draw(mask)
+
+    active_regions: set[str] = set()
+    for au in au_list:
+        for region in AU_TO_MASK_REGIONS.get(au.name, []):
+            active_regions.add(region)
+
+    def to_px(point: Tuple[float, float]) -> Tuple[int, int]:
+        x = int(round(point[0] * (size - 1)))
+        y = int(round(point[1] * (size - 1)))
+        return x, y
+
+    point_radius = max(4, size // 96)
+    for region_name in sorted(active_regions):
+        indices = FACE_REGIONS.get(region_name, [])
+        region_points = []
+        for idx in indices:
+            if idx >= len(face_points):
+                continue
+            point = face_points[idx]
+            if point is None:
+                continue
+            region_points.append(to_px(point))
+
+        if len(region_points) >= 3:
+            draw.polygon(region_points, fill=255)
+        elif len(region_points) == 2:
+            draw.line(region_points, fill=255, width=max(4, point_radius * 2))
+
+        for x, y in region_points:
+            draw.ellipse((x - point_radius, y - point_radius, x + point_radius, y + point_radius), fill=255)
+
+    # Fallback: if mask is empty, use a centered face bounding rectangle.
+    if np.asarray(mask, dtype=np.uint8).max() == 0:
+        valid = [point for point in face_points if point is not None]
+        if valid:
+            xs = [point[0] for point in valid]
+            ys = [point[1] for point in valid]
+            margin = 0.08
+            x0 = int(max(0.0, min(xs) - margin) * (size - 1))
+            y0 = int(max(0.0, min(ys) - margin) * (size - 1))
+            x1 = int(min(1.0, max(xs) + margin) * (size - 1))
+            y1 = int(min(1.0, max(ys) + margin) * (size - 1))
+            draw.rectangle((x0, y0, x1, y1), fill=255)
+
+    # Expand and feather mask to avoid hard seams.
+    dilate_kernel = max(3, (size // 48) | 1)  # odd kernel size for MaxFilter
+    feather_radius = max(2, size // 128)
+    mask = mask.filter(ImageFilter.MaxFilter(dilate_kernel))
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=feather_radius))
+    return mask
+
+
+def load_pipeline(use_cuda: bool) -> StableDiffusionXLControlNetInpaintPipeline:
     dtype = torch.float16 if use_cuda else torch.float32
     controlnet = ControlNetModel.from_pretrained(CONTROLNET_MODEL_ID, torch_dtype=dtype)
 
     checkpoint_path = Path(BASE_MODEL_ID).expanduser()
     if checkpoint_path.is_file():
-        pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_single_file(
+        pipe = StableDiffusionXLControlNetInpaintPipeline.from_single_file(
             checkpoint_path.as_posix(),
             controlnet=controlnet,
             torch_dtype=dtype,
@@ -321,25 +395,26 @@ def load_pipeline(use_cuda: bool) -> StableDiffusionXLControlNetImg2ImgPipeline:
     elif "::" in BASE_MODEL_ID:
         repo_id, filename = BASE_MODEL_ID.split("::", 1)
         model_path = hf_hub_download(repo_id.strip(), filename.strip())
-        pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_single_file(
+        pipe = StableDiffusionXLControlNetInpaintPipeline.from_single_file(
             model_path,
             controlnet=controlnet,
             torch_dtype=dtype,
         )
     else:
         try:
-            pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
+            pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
                 BASE_MODEL_ID,
                 controlnet=controlnet,
                 torch_dtype=dtype,
                 use_safetensors=True,
             )
         except Exception:
-            model_path = hf_hub_download(BASE_MODEL_ID, JUGGERNAUT_XL_DEFAULT_FILE)
-            pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_single_file(
-                model_path,
+            # Fallback to a known SDXL inpainting base in case the main checkpoint is not inpaint-compatible.
+            pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
+                INPAINT_BASE_FALLBACK_MODEL_ID,
                 controlnet=controlnet,
                 torch_dtype=dtype,
+                use_safetensors=True,
             )
 
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
@@ -381,6 +456,7 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
 
     original_control_image = render_openpose_map(draw_poses_fn, poses, parsed_size)
     target_control_image = render_openpose_map(draw_poses_fn, modified_poses, parsed_size)
+    inpaint_mask = build_inpaint_mask(original_face, parsed_aus, parsed_size)
 
     out_dir = output if output is not None else OUTPUT_ROOT
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -394,6 +470,7 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
     target_face_path = out_dir / f"{stem}__face_target.json"
     control_original_path = out_dir / f"{stem}__control_original.png"
     control_target_path = out_dir / f"{stem}__control_target.png"
+    mask_path = out_dir / f"{stem}__mask.png"
     result_path = out_dir / f"{stem}__result.png"
     meta_path = out_dir / f"{stem}__meta.json"
 
@@ -402,6 +479,7 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
     save_face_points(target_face_path, target_face)
     original_control_image.save(control_original_path)
     target_control_image.save(control_target_path)
+    inpaint_mask.save(mask_path)
 
     use_cuda = torch.cuda.is_available()
     device = "cuda" if use_cuda else "cpu"
@@ -413,10 +491,11 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
         prompt=prompt,
         negative_prompt=BASE_NEGATIVE,
         image=input_image,
+        mask_image=inpaint_mask,
         control_image=target_control_image,
         num_inference_steps=STEPS,
         guidance_scale=CFG,
-        strength=IMG2IMG_STRENGTH,
+        strength=INPAINT_STRENGTH,
         controlnet_conditioning_scale=CONTROLNET_SCALE,
         generator=generator,
     ).images[0]
@@ -434,7 +513,7 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
         "openpose_annotators_repo": OPENPOSE_ANNOTATORS_REPO,
         "steps": STEPS,
         "cfg": CFG,
-        "strength": IMG2IMG_STRENGTH,
+        "strength": INPAINT_STRENGTH,
         "controlnet_scale": CONTROLNET_SCALE,
         "prompt": prompt,
         "negative_prompt": BASE_NEGATIVE,
@@ -442,6 +521,7 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
         "openpose_face_target_path": target_face_path.as_posix(),
         "control_image_original_path": control_original_path.as_posix(),
         "control_image_target_path": control_target_path.as_posix(),
+        "inpaint_mask_path": mask_path.as_posix(),
         "result_image_path": result_path.as_posix(),
     }
     with meta_path.open("w", encoding="utf-8") as file:
