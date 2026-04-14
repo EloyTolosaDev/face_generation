@@ -1,14 +1,15 @@
 from argparse import ArgumentParser
+import copy
 import json
 import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageOps
 from diffusers import (
     ControlNetModel,
     DPMSolverMultistepScheduler,
@@ -22,12 +23,13 @@ from huggingface_hub import hf_hub_download
 # ---------------------------------------
 BASE_MODEL_ID = "RunDiffusion/Juggernaut-XL-v9"
 CONTROLNET_MODEL_ID = "xinsir/controlnet-openpose-sdxl-1.0"
+OPENPOSE_ANNOTATORS_REPO = "lllyasviel/Annotators"
 JUGGERNAUT_XL_DEFAULT_FILE = "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"
 
 STEPS = 24
-CFG = 4.5
+CFG = 3.8
 IMG2IMG_STRENGTH = 0.35
-CONTROLNET_SCALE = 1.0
+CONTROLNET_SCALE = 1.2
 
 BASE_POSITIVE = (
     "photorealistic studio portrait photo, same person identity, same hair and skin tone, centered composition, "
@@ -41,72 +43,57 @@ OUTPUT_ROOT = Path("./suites/au_apply")
 
 
 # ---------------------------------------
-# Landmark and AU delta configuration
+# OpenPose-face AU deltas
 # ---------------------------------------
-# The deltas are in normalized image coordinates (x,y in [0,1]).
-# Positive y means "move down". Negative y means "move up".
+# These indices follow the common 68/70-point facial layout used by OpenPose face.
+# Deltas are normalized image-space shifts.
 AU_DELTAS: Dict[str, Dict[int, Tuple[float, float]]] = {
-    # AU4: Brow lowerer (corrugator/depressor)
+    # AU4: Brow lowerer
     "AU4": {
-        70: (0.003, 0.020),
-        63: (0.002, 0.020),
-        105: (0.001, 0.018),
-        66: (0.000, 0.017),
-        107: (-0.001, 0.017),
-        336: (-0.003, 0.020),
-        296: (-0.002, 0.020),
-        334: (-0.001, 0.018),
-        293: (0.000, 0.017),
-        300: (0.001, 0.017),
+        17: (0.003, 0.018),
+        18: (0.002, 0.020),
+        19: (0.001, 0.021),
+        20: (0.000, 0.020),
+        21: (-0.001, 0.018),
+        22: (0.001, 0.018),
+        23: (0.000, 0.020),
+        24: (-0.001, 0.021),
+        25: (-0.002, 0.020),
+        26: (-0.003, 0.018),
     },
     # AU7: Lid tightener
     "AU7": {
-        159: (0.000, 0.010),
-        158: (0.000, 0.011),
-        157: (0.000, 0.012),
-        386: (0.000, 0.010),
-        385: (0.000, 0.011),
-        384: (0.000, 0.012),
-        145: (0.000, -0.008),
-        153: (0.000, -0.008),
-        374: (0.000, -0.008),
-        380: (0.000, -0.008),
+        37: (0.000, 0.010),
+        38: (0.000, 0.011),
+        40: (0.000, -0.008),
+        41: (0.000, -0.008),
+        43: (0.000, 0.010),
+        44: (0.000, 0.011),
+        46: (0.000, -0.008),
+        47: (0.000, -0.008),
     },
-    # AU23: Lip tightener
+    # AU23: Lip tightener (corners inward + lips tense)
     "AU23": {
-        61: (0.008, 0.000),
-        291: (-0.008, 0.000),
-        0: (0.000, -0.004),
-        17: (0.000, 0.004),
+        48: (0.010, 0.000),
+        54: (-0.010, 0.000),
+        51: (0.000, -0.003),
+        57: (0.000, 0.003),
     },
-    # AU24: Lip pressor
+    # AU24: Lip pressor (reduce mouth aperture)
     "AU24": {
-        13: (0.000, 0.010),
-        14: (0.000, -0.010),
-        78: (0.000, 0.006),
-        308: (0.000, 0.006),
-        81: (0.000, 0.006),
-        311: (0.000, 0.006),
+        62: (0.000, 0.008),
+        66: (0.000, -0.008),
+        63: (0.000, 0.005),
+        65: (0.000, -0.005),
     },
 }
 
 AU_TEXT: Dict[str, str] = {
-    "AU4": "brows lowered and drawn together with glabellar tension",
-    "AU7": "eyelids tightened with narrowed eyes",
-    "AU23": "lips tightened into a tense straight mouth",
-    "AU24": "lips pressed together strongly",
+    "AU4": "brows lowered and drawn together",
+    "AU7": "eyelids tightened",
+    "AU23": "lips tightened",
+    "AU24": "lips pressed",
 }
-
-# Feature lines used to render control map.
-FEATURE_LINES: List[List[int]] = [
-    [70, 63, 105, 66, 107],          # left brow
-    [336, 296, 334, 293, 300],       # right brow
-    [33, 160, 158, 133, 153, 144, 33],    # left eye
-    [362, 385, 387, 263, 373, 380, 362],  # right eye
-    [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291],  # outer mouth
-    [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308],   # inner mouth
-    [10, 151, 9, 8, 168, 6, 197, 195, 5],  # nose bridge/tip
-]
 
 
 @dataclass
@@ -119,13 +106,12 @@ def normalize_size(size: int) -> int:
     return max(64, ((int(size) + 7) // 8) * 8)
 
 
+def sanitize_token(value: str) -> str:
+    token = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
+    return token or "item"
+
+
 def parse_au_token(token: str) -> ParsedAU:
-    """
-    Supported token formats:
-    - AU4
-    - AU4=1.2
-    - AU4_HIGH / AU4_MEDIUM / AU4_LOW
-    """
     raw = str(token).strip().upper()
     if not raw:
         raise ValueError("Empty AU token")
@@ -155,68 +141,164 @@ def parse_au_token(token: str) -> ParsedAU:
     return ParsedAU(name=raw, intensity=max(0.0, min(2.0, intensity)))
 
 
-def detect_landmarks_mediapipe(image: Image.Image) -> np.ndarray:
-    """
-    Returns:
-        numpy array of shape [468, 2] with normalized x/y coordinates.
-    """
+def load_openpose_backend() -> Tuple[Any, Any]:
     try:
-        import mediapipe as mp
+        from controlnet_aux import OpenposeDetector
+        from controlnet_aux.open_pose import draw_poses
     except Exception as exc:
         raise RuntimeError(
-            "MediaPipe is required for landmark extraction. Install it with: pip install mediapipe"
+            "OpenPose backend is required. Install with: pip install controlnet_aux opencv-python"
         ) from exc
 
-    rgb = np.asarray(image.convert("RGB"))
-    face_mesh = mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-    )
-    result = face_mesh.process(rgb)
-    face_mesh.close()
-
-    if not result.multi_face_landmarks:
-        raise RuntimeError("No face detected in image.")
-
-    pts = result.multi_face_landmarks[0].landmark
-    landmarks = np.array([(pt.x, pt.y) for pt in pts], dtype=np.float32)
-    return landmarks
+    detector = OpenposeDetector.from_pretrained(OPENPOSE_ANNOTATORS_REPO)
+    if not hasattr(detector, "detect_poses"):
+        raise RuntimeError(
+            "Installed controlnet_aux does not provide OpenPose keypoint extraction API (detect_poses). "
+            "Please install a newer controlnet_aux version."
+        )
+    return detector, draw_poses
 
 
-def apply_au_deltas(landmarks: np.ndarray, au_list: List[ParsedAU]) -> np.ndarray:
-    target = landmarks.copy()
+def get_keypoint_xy(keypoint: Any) -> Optional[Tuple[float, float]]:
+    if keypoint is None:
+        return None
+
+    if hasattr(keypoint, "x") and hasattr(keypoint, "y"):
+        return float(keypoint.x), float(keypoint.y)
+
+    if isinstance(keypoint, (list, tuple)) and len(keypoint) >= 2:
+        return float(keypoint[0]), float(keypoint[1])
+
+    return None
+
+
+def clone_keypoint_with_xy(template_keypoint: Any, x: float, y: float) -> Any:
+    if template_keypoint is None:
+        return None
+
+    if hasattr(template_keypoint, "_replace"):
+        try:
+            return template_keypoint._replace(x=float(x), y=float(y))
+        except Exception:
+            pass
+
+    try:
+        return type(template_keypoint)(x=float(x), y=float(y))
+    except Exception:
+        pass
+
+    try:
+        clone = copy.copy(template_keypoint)
+        setattr(clone, "x", float(x))
+        setattr(clone, "y", float(y))
+        return clone
+    except Exception:
+        pass
+
+    return template_keypoint
+
+
+def extract_face_points(face_keypoints: List[Any]) -> List[Optional[Tuple[float, float]]]:
+    points: List[Optional[Tuple[float, float]]] = []
+    for kp in face_keypoints:
+        points.append(get_keypoint_xy(kp))
+    return points
+
+
+def face_bbox_area(face_points: List[Optional[Tuple[float, float]]]) -> float:
+    valid = [point for point in face_points if point is not None]
+    if len(valid) < 4:
+        return 0.0
+    xs = [point[0] for point in valid]
+    ys = [point[1] for point in valid]
+    return max(0.0, max(xs) - min(xs)) * max(0.0, max(ys) - min(ys))
+
+
+def select_main_face_pose_index(poses: List[Any]) -> int:
+    best_idx = -1
+    best_area = -1.0
+    for idx, pose in enumerate(poses):
+        face_keypoints = getattr(pose, "face", None)
+        if not face_keypoints:
+            continue
+        points = extract_face_points(face_keypoints)
+        area = face_bbox_area(points)
+        if area > best_area:
+            best_area = area
+            best_idx = idx
+    if best_idx < 0:
+        raise RuntimeError("OpenPose did not detect a usable face keypoint set.")
+    return best_idx
+
+
+def apply_au_deltas_to_face_points(
+    face_points: List[Optional[Tuple[float, float]]],
+    au_list: List[ParsedAU],
+) -> List[Optional[Tuple[float, float]]]:
+    target = list(face_points)
     for au in au_list:
-        deltas = AU_DELTAS[au.name]
-        for idx, (dx, dy) in deltas.items():
-            target[idx, 0] += dx * au.intensity
-            target[idx, 1] += dy * au.intensity
-
-    target[:, 0] = np.clip(target[:, 0], 0.0, 1.0)
-    target[:, 1] = np.clip(target[:, 1], 0.0, 1.0)
+        delta_map = AU_DELTAS[au.name]
+        for idx, (dx, dy) in delta_map.items():
+            if idx >= len(target):
+                continue
+            point = target[idx]
+            if point is None:
+                continue
+            x = min(1.0, max(0.0, point[0] + dx * au.intensity))
+            y = min(1.0, max(0.0, point[1] + dy * au.intensity))
+            target[idx] = (x, y)
     return target
 
 
-def render_landmark_control_map(landmarks: np.ndarray, size: int) -> Image.Image:
-    canvas = Image.new("RGB", (size, size), "black")
-    draw = ImageDraw.Draw(canvas)
+def inject_face_points_into_pose(pose: Any, target_face_points: List[Optional[Tuple[float, float]]]) -> Any:
+    original_face = getattr(pose, "face", None)
+    if original_face is None:
+        raise RuntimeError("Selected pose does not contain face keypoints.")
 
-    def to_px(point: Tuple[float, float]) -> Tuple[int, int]:
-        x = int(round(point[0] * (size - 1)))
-        y = int(round(point[1] * (size - 1)))
-        return (x, y)
+    updated_face = []
+    for idx, kp in enumerate(original_face):
+        if idx >= len(target_face_points):
+            updated_face.append(kp)
+            continue
+        target_point = target_face_points[idx]
+        if target_point is None or kp is None:
+            updated_face.append(kp)
+            continue
+        updated_face.append(clone_keypoint_with_xy(kp, target_point[0], target_point[1]))
 
-    for line in FEATURE_LINES:
-        coords = [to_px((float(landmarks[i, 0]), float(landmarks[i, 1]))) for i in line]
-        draw.line(coords, fill=(255, 255, 255), width=2)
+    if hasattr(pose, "_replace"):
+        return pose._replace(face=updated_face)
 
-    for idx in [70, 63, 105, 336, 296, 334, 13, 14, 61, 291, 159, 145, 386, 374]:
-        px = to_px((float(landmarks[idx, 0]), float(landmarks[idx, 1])))
-        r = 2
-        draw.ellipse((px[0] - r, px[1] - r, px[0] + r, px[1] + r), fill=(255, 255, 255))
+    clone_pose = copy.copy(pose)
+    setattr(clone_pose, "face", updated_face)
+    return clone_pose
 
-    return canvas
+
+def render_openpose_map(draw_poses_fn: Any, poses: List[Any], size: int) -> Image.Image:
+    canvas = draw_poses_fn(
+        poses,
+        H=size,
+        W=size,
+        draw_body=True,
+        draw_hand=False,
+        draw_face=True,
+    )
+    canvas = np.asarray(canvas, dtype=np.uint8)
+    if canvas.ndim != 3:
+        raise RuntimeError("OpenPose draw_poses returned an unexpected canvas format.")
+    return Image.fromarray(canvas)
+
+
+def save_face_points(path: Path, face_points: List[Optional[Tuple[float, float]]]) -> None:
+    data = []
+    for idx, point in enumerate(face_points):
+        if point is None:
+            data.append({"idx": idx, "x": None, "y": None})
+        else:
+            data.append({"idx": idx, "x": float(point[0]), "y": float(point[1])})
+
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2)
 
 
 def build_prompt(au_list: List[ParsedAU]) -> str:
@@ -270,17 +352,6 @@ def load_pipeline(use_cuda: bool) -> StableDiffusionXLControlNetImg2ImgPipeline:
     return pipe.to(device)
 
 
-def save_landmarks(path: Path, landmarks: np.ndarray) -> None:
-    data = [{"idx": int(i), "x": float(pt[0]), "y": float(pt[1])} for i, pt in enumerate(landmarks)]
-    with path.open("w", encoding="utf-8") as file:
-        json.dump(data, file, indent=2)
-
-
-def sanitize_token(value: str) -> str:
-    token = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
-    return token or "item"
-
-
 def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, output: Path | None) -> None:
     if not image_path.exists():
         raise FileNotFoundError(f"Image path does not exist: {image_path.as_posix()}")
@@ -291,9 +362,25 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
     input_image = Image.open(image_path).convert("RGB")
     input_image = ImageOps.fit(input_image, (parsed_size, parsed_size), method=Image.Resampling.LANCZOS)
 
-    landmarks = detect_landmarks_mediapipe(input_image)
-    target_landmarks = apply_au_deltas(landmarks, parsed_aus)
-    control_image = render_landmark_control_map(target_landmarks, parsed_size)
+    openpose_detector, draw_poses_fn = load_openpose_backend()
+    poses = openpose_detector.detect_poses(
+        np.asarray(input_image, dtype=np.uint8),
+        include_hand=False,
+        include_face=True,
+    )
+    if not poses:
+        raise RuntimeError("OpenPose did not detect any pose in the input image.")
+
+    selected_idx = select_main_face_pose_index(poses)
+    selected_pose = poses[selected_idx]
+    original_face = extract_face_points(getattr(selected_pose, "face"))
+    target_face = apply_au_deltas_to_face_points(original_face, parsed_aus)
+
+    modified_poses = list(poses)
+    modified_poses[selected_idx] = inject_face_points_into_pose(selected_pose, target_face)
+
+    original_control_image = render_openpose_map(draw_poses_fn, poses, parsed_size)
+    target_control_image = render_openpose_map(draw_poses_fn, modified_poses, parsed_size)
 
     out_dir = output if output is not None else OUTPUT_ROOT
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -303,16 +390,18 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
     stem = f"{sanitize_token(image_path.stem)}__{au_label}__{run_seed}"
 
     source_path = out_dir / f"{stem}__input.png"
-    landmarks_path = out_dir / f"{stem}__landmarks_original.json"
-    target_landmarks_path = out_dir / f"{stem}__landmarks_target.json"
-    control_path = out_dir / f"{stem}__control.png"
+    original_face_path = out_dir / f"{stem}__face_original.json"
+    target_face_path = out_dir / f"{stem}__face_target.json"
+    control_original_path = out_dir / f"{stem}__control_original.png"
+    control_target_path = out_dir / f"{stem}__control_target.png"
     result_path = out_dir / f"{stem}__result.png"
     meta_path = out_dir / f"{stem}__meta.json"
 
     input_image.save(source_path)
-    save_landmarks(landmarks_path, landmarks)
-    save_landmarks(target_landmarks_path, target_landmarks)
-    control_image.save(control_path)
+    save_face_points(original_face_path, original_face)
+    save_face_points(target_face_path, target_face)
+    original_control_image.save(control_original_path)
+    target_control_image.save(control_target_path)
 
     use_cuda = torch.cuda.is_available()
     device = "cuda" if use_cuda else "cpu"
@@ -324,7 +413,7 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
         prompt=prompt,
         negative_prompt=BASE_NEGATIVE,
         image=input_image,
-        control_image=control_image,
+        control_image=target_control_image,
         num_inference_steps=STEPS,
         guidance_scale=CFG,
         strength=IMG2IMG_STRENGTH,
@@ -339,24 +428,27 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
         "aus": [{"name": au.name, "intensity": au.intensity} for au in parsed_aus],
         "seed": run_seed,
         "image_size": parsed_size,
+        "selected_pose_index": selected_idx,
         "base_model_id": BASE_MODEL_ID,
         "controlnet_model_id": CONTROLNET_MODEL_ID,
+        "openpose_annotators_repo": OPENPOSE_ANNOTATORS_REPO,
         "steps": STEPS,
         "cfg": CFG,
         "strength": IMG2IMG_STRENGTH,
         "controlnet_scale": CONTROLNET_SCALE,
         "prompt": prompt,
         "negative_prompt": BASE_NEGATIVE,
-        "landmarks_original_path": landmarks_path.as_posix(),
-        "landmarks_target_path": target_landmarks_path.as_posix(),
-        "control_image_path": control_path.as_posix(),
+        "openpose_face_original_path": original_face_path.as_posix(),
+        "openpose_face_target_path": target_face_path.as_posix(),
+        "control_image_original_path": control_original_path.as_posix(),
+        "control_image_target_path": control_target_path.as_posix(),
         "result_image_path": result_path.as_posix(),
     }
     with meta_path.open("w", encoding="utf-8") as file:
         json.dump(meta, file, indent=2)
 
     print(f"Done. Result image: {result_path.as_posix()}")
-    print(f"Control map: {control_path.as_posix()}")
+    print(f"OpenPose target control map: {control_target_path.as_posix()}")
     print(f"Meta: {meta_path.as_posix()}")
 
 
@@ -369,7 +461,7 @@ def main() -> None:
         required=True,
         help="List of AUs (e.g. AU4 AU7 or AU4=1.2 AU7=0.8). Supported: AU4, AU7, AU23, AU24.",
     )
-    parser.add_argument("--image_size", type=int, default=1024, help="Square working size for detection and generation.")
+    parser.add_argument("--image_size", type=int, default=1024, help="Square working size for OpenPose and generation.")
     parser.add_argument("--seed", type=int, help="Optional generation seed.")
     parser.add_argument("--output", type=Path, help="Optional output directory.")
     args = parser.parse_args()
