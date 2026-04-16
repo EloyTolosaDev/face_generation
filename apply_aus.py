@@ -29,7 +29,7 @@ JUGGERNAUT_XL_DEFAULT_FILE = "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"
 STEPS = 24
 CFG = 3.8
 INPAINT_STRENGTH = 0.35
-CONTROLNET_SCALE = 1.2
+CONTROLNET_SCALE = 2.0
 
 BASE_POSITIVE = (
     "photorealistic studio portrait photo, same person identity, same hair and skin tone, centered composition, "

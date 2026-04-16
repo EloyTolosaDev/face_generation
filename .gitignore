@@ -207,6 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 # ==== CUSTOM
-# suites folder is where image generation suites are generated locally
 suites
 *codex
+samples
+.hf_cache
