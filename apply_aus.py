@@ -298,7 +298,7 @@ def render_openpose_map(draw_poses_fn: Any, poses: List[Any], size: int) -> Imag
         poses,
         H=size,
         W=size,
-        draw_body=True,
+        draw_body=False,
         draw_hand=False,
         draw_face=True,
     )
