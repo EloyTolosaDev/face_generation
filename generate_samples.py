@@ -7,17 +7,16 @@ import time
 from pathlib import Path
 
 import torch
-from diffusers import DPMSolverMultistepScheduler, StableDiffusionXLPipeline
-from huggingface_hub import hf_hub_download
+from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
 from tqdm import tqdm
 
 
 # ---------------------------------------
 # Global generation settings
 # ---------------------------------------
-MODEL_ID = "RunDiffusion/Juggernaut-XL-v9"
-JUGGERNAUT_XL_DEFAULT_FILE = "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"
+MODEL_ID = "stabilityai/stable-diffusion-2-1"
 OUTPUT_ROOT = Path("./samples")
+SAMPLE_IMAGE_SIZE = 768
 NEUTRAL_STEPS = 20
 NEUTRAL_CFG = 3.0
 
@@ -61,26 +60,14 @@ def compose_neutral_prompt(demographic_text: str) -> str:
     return f"{demographic_text}, {BASE_POSITIVE}, {NEUTRAL_TEMPLATE_SUFFIX}"
 
 
-def load_text2img_pipe(use_cuda: bool) -> StableDiffusionXLPipeline:
+def load_text2img_pipe(use_cuda: bool) -> StableDiffusionPipeline:
     dtype = torch.float16 if use_cuda else torch.float32
 
-    checkpoint_path = Path(MODEL_ID).expanduser()
-    if checkpoint_path.is_file():
-        pipe = StableDiffusionXLPipeline.from_single_file(checkpoint_path.as_posix(), torch_dtype=dtype)
-    elif "::" in MODEL_ID:
-        repo_id, filename = MODEL_ID.split("::", 1)
-        model_path = hf_hub_download(repo_id.strip(), filename.strip())
-        pipe = StableDiffusionXLPipeline.from_single_file(model_path, torch_dtype=dtype)
-    else:
-        try:
-            pipe = StableDiffusionXLPipeline.from_pretrained(
-                MODEL_ID,
-                torch_dtype=dtype,
-                use_safetensors=True,
-            )
-        except Exception:
-            model_path = hf_hub_download(MODEL_ID, JUGGERNAUT_XL_DEFAULT_FILE)
-            pipe = StableDiffusionXLPipeline.from_single_file(model_path, torch_dtype=dtype)
+    pipe = StableDiffusionPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=dtype,
+        use_safetensors=True,
+    )
 
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     device = "cuda" if use_cuda else "cpu"
@@ -94,20 +81,18 @@ def load_text2img_pipe(use_cuda: bool) -> StableDiffusionXLPipeline:
     return pipe.to(device)
 
 
-def normalize_sdxl_size(size: int) -> int:
+def normalize_image_size(size: int) -> int:
     return max(64, ((int(size) + 7) // 8) * 8)
 
 
-def generate_samples(seeds_per_combination: int, image_size: int) -> None:
+def generate_samples(seeds_per_combination: int) -> None:
     use_cuda = torch.cuda.is_available()
     if use_cuda:
         print("CUDA available: running sample generation on GPU.")
     else:
         print("CUDA unavailable: running sample generation on CPU.")
 
-    img_size = normalize_sdxl_size(image_size)
-    if img_size != image_size:
-        print(f"--image_size {image_size} adjusted to {img_size} (SDXL requires multiples of 8).")
+    img_size = normalize_image_size(SAMPLE_IMAGE_SIZE)
 
     images_dir = OUTPUT_ROOT / "images"
     meta_dir = OUTPUT_ROOT / "meta"
@@ -188,12 +173,6 @@ def main() -> None:
         default=1,
         help="Amount of images per demographic combination.",
     )
-    parser.add_argument(
-        "--image_size",
-        type=int,
-        default=1024,
-        help="Square output image size.",
-    )
     args = parser.parse_args()
 
     if not args.samples:
@@ -201,7 +180,7 @@ def main() -> None:
     if args.seeds < 1:
         parser.error("--seeds must be >= 1")
 
-    generate_samples(seeds_per_combination=int(args.seeds), image_size=int(args.image_size))
+    generate_samples(seeds_per_combination=int(args.seeds))
 
 
 if __name__ == "__main__":

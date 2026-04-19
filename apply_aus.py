@@ -1,5 +1,4 @@
 from argparse import ArgumentParser
-import copy
 import json
 import random
 import re
@@ -13,7 +12,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from diffusers import (
     ControlNetModel,
     DPMSolverMultistepScheduler,
-    StableDiffusionXLControlNetInpaintPipeline,
+    StableDiffusionControlNetInpaintPipeline,
 )
 from huggingface_hub import hf_hub_download
 
@@ -21,10 +20,8 @@ from huggingface_hub import hf_hub_download
 # ---------------------------------------
 # Global generation settings (not CLI)
 # ---------------------------------------
-BASE_MODEL_ID = "RunDiffusion/Juggernaut-XL-v9"
-CONTROLNET_MODEL_ID = "xinsir/controlnet-openpose-sdxl-1.0"
-OPENPOSE_ANNOTATORS_REPO = "lllyasviel/Annotators"
-JUGGERNAUT_XL_DEFAULT_FILE = "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"
+BASE_MODEL_ID = "stabilityai/stable-diffusion-2-1"
+CONTROLNET_MODEL_ID = "CrucibleAI/ControlNetMediaPipeFace"
 
 STEPS = 24
 CFG = 3.8
@@ -40,52 +37,56 @@ BASE_NEGATIVE = (
 )
 
 OUTPUT_ROOT = Path("./suites/au_apply")
-INPAINT_BASE_FALLBACK_MODEL_ID = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+INPAINT_BASE_FALLBACK_MODEL_ID = "stabilityai/stable-diffusion-2-inpainting"
 
 
 # ---------------------------------------
-# OpenPose-face AU deltas
+# MediaPipe-face AU deltas
 # ---------------------------------------
-# These indices follow the common 68/70-point facial layout used by OpenPose face.
+# Indices follow MediaPipe Face Mesh topology.
 # Deltas are normalized image-space shifts.
 AU_DELTAS: Dict[str, Dict[int, Tuple[float, float]]] = {
     # AU4: Brow lowerer
     "AU4": {
-        17: (0.003, 0.018),
-        18: (0.002, 0.020),
-        19: (0.001, 0.021),
-        20: (0.000, 0.020),
-        21: (-0.001, 0.018),
-        22: (0.001, 0.018),
-        23: (0.000, 0.020),
-        24: (-0.001, 0.021),
-        25: (-0.002, 0.020),
-        26: (-0.003, 0.018),
+        70: (0.003, 0.018),
+        63: (0.002, 0.020),
+        105: (0.001, 0.021),
+        66: (0.000, 0.020),
+        107: (-0.001, 0.018),
+        336: (0.001, 0.018),
+        296: (0.000, 0.020),
+        334: (-0.001, 0.021),
+        293: (-0.002, 0.020),
+        300: (-0.003, 0.018),
     },
     # AU7: Lid tightener
     "AU7": {
-        37: (0.000, 0.010),
-        38: (0.000, 0.011),
-        40: (0.000, -0.008),
-        41: (0.000, -0.008),
-        43: (0.000, 0.010),
-        44: (0.000, 0.011),
-        46: (0.000, -0.008),
-        47: (0.000, -0.008),
+        159: (0.000, 0.010),
+        160: (0.000, 0.011),
+        158: (0.000, 0.010),
+        145: (0.000, -0.008),
+        153: (0.000, -0.008),
+        144: (0.000, -0.008),
+        386: (0.000, 0.010),
+        385: (0.000, 0.011),
+        387: (0.000, 0.010),
+        374: (0.000, -0.008),
+        380: (0.000, -0.008),
+        373: (0.000, -0.008),
     },
     # AU23: Lip tightener (corners inward + lips tense)
     "AU23": {
-        48: (0.010, 0.000),
-        54: (-0.010, 0.000),
-        51: (0.000, -0.003),
-        57: (0.000, 0.003),
+        61: (0.010, 0.000),
+        291: (-0.010, 0.000),
+        13: (0.000, -0.003),
+        14: (0.000, 0.003),
     },
     # AU24: Lip pressor (reduce mouth aperture)
     "AU24": {
-        62: (0.000, 0.008),
-        66: (0.000, -0.008),
-        63: (0.000, 0.005),
-        65: (0.000, -0.005),
+        13: (0.000, 0.008),
+        14: (0.000, -0.008),
+        78: (0.000, 0.005),
+        308: (0.000, -0.005),
     },
 }
 
@@ -96,13 +97,13 @@ AU_TEXT: Dict[str, str] = {
     "AU24": "lips pressed",
 }
 
-# OpenPose face landmark topology regions (68-point convention).
+# MediaPipe Face Mesh regions.
 FACE_REGIONS: Dict[str, List[int]] = {
-    "brows": list(range(17, 27)),
-    "left_eye": list(range(36, 42)),
-    "right_eye": list(range(42, 48)),
-    "outer_mouth": list(range(48, 60)),
-    "inner_mouth": list(range(60, 68)),
+    "brows": [70, 63, 105, 66, 107, 336, 296, 334, 293, 300],
+    "left_eye": [33, 160, 159, 158, 133, 153, 145, 144],
+    "right_eye": [362, 385, 386, 387, 263, 373, 374, 380],
+    "outer_mouth": [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291],
+    "inner_mouth": [78, 191, 80, 13, 310, 415, 308, 324, 14, 87],
 }
 
 # Which regions should be editable per AU.
@@ -159,68 +160,43 @@ def parse_au_token(token: str) -> ParsedAU:
     return ParsedAU(name=raw, intensity=max(0.0, min(2.0, intensity)))
 
 
-def load_openpose_backend() -> Tuple[Any, Any]:
+def load_mediapipe_backend() -> Tuple[Any, Any, Any]:
     try:
-        from controlnet_aux.open_pose import OpenposeDetector
-        from controlnet_aux.open_pose import draw_poses
+        import mediapipe as mp
+        from mediapipe.framework.formats import landmark_pb2
     except Exception as exc:
         raise RuntimeError(
-            "OpenPose backend is required. Install with: pip install controlnet_aux opencv-python. "
+            "MediaPipe backend is required. Install with: pip install mediapipe. "
             f"Original import error: {exc}"
         ) from exc
 
-    detector = OpenposeDetector.from_pretrained(OPENPOSE_ANNOTATORS_REPO)
-    if not hasattr(detector, "detect_poses"):
+    if not hasattr(mp, "solutions"):
         raise RuntimeError(
-            "Installed controlnet_aux does not provide OpenPose keypoint extraction API (detect_poses). "
-            "Please install a newer controlnet_aux version."
+            "Installed mediapipe package does not expose mediapipe.solutions. "
+            "Please install a compatible mediapipe version."
         )
-    return detector, draw_poses
+
+    detector = mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=5,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+    )
+    return mp, landmark_pb2, detector
 
 
-def get_keypoint_xy(keypoint: Any) -> Optional[Tuple[float, float]]:
-    if keypoint is None:
+def get_landmark_xy(landmark: Any) -> Optional[Tuple[float, float]]:
+    if landmark is None:
         return None
-
-    if hasattr(keypoint, "x") and hasattr(keypoint, "y"):
-        return float(keypoint.x), float(keypoint.y)
-
-    if isinstance(keypoint, (list, tuple)) and len(keypoint) >= 2:
-        return float(keypoint[0]), float(keypoint[1])
-
+    if hasattr(landmark, "x") and hasattr(landmark, "y"):
+        return float(landmark.x), float(landmark.y)
     return None
 
 
-def clone_keypoint_with_xy(template_keypoint: Any, x: float, y: float) -> Any:
-    if template_keypoint is None:
-        return None
-
-    if hasattr(template_keypoint, "_replace"):
-        try:
-            return template_keypoint._replace(x=float(x), y=float(y))
-        except Exception:
-            pass
-
-    try:
-        return type(template_keypoint)(x=float(x), y=float(y))
-    except Exception:
-        pass
-
-    try:
-        clone = copy.copy(template_keypoint)
-        setattr(clone, "x", float(x))
-        setattr(clone, "y", float(y))
-        return clone
-    except Exception:
-        pass
-
-    return template_keypoint
-
-
-def extract_face_points(face_keypoints: List[Any]) -> List[Optional[Tuple[float, float]]]:
+def extract_face_points(face_landmarks: Any) -> List[Optional[Tuple[float, float]]]:
     points: List[Optional[Tuple[float, float]]] = []
-    for kp in face_keypoints:
-        points.append(get_keypoint_xy(kp))
+    for lm in face_landmarks.landmark:
+        points.append(get_landmark_xy(lm))
     return points
 
 
@@ -233,20 +209,17 @@ def face_bbox_area(face_points: List[Optional[Tuple[float, float]]]) -> float:
     return max(0.0, max(xs) - min(xs)) * max(0.0, max(ys) - min(ys))
 
 
-def select_main_face_pose_index(poses: List[Any]) -> int:
+def select_main_face_index(face_landmark_list: List[Any]) -> int:
     best_idx = -1
     best_area = -1.0
-    for idx, pose in enumerate(poses):
-        face_keypoints = getattr(pose, "face", None)
-        if not face_keypoints:
-            continue
-        points = extract_face_points(face_keypoints)
+    for idx, face_landmarks in enumerate(face_landmark_list):
+        points = extract_face_points(face_landmarks)
         area = face_bbox_area(points)
         if area > best_area:
             best_area = area
             best_idx = idx
     if best_idx < 0:
-        raise RuntimeError("OpenPose did not detect a usable face keypoint set.")
+        raise RuntimeError("MediaPipe did not detect a usable face landmark set.")
     return best_idx
 
 
@@ -269,42 +242,52 @@ def apply_au_deltas_to_face_points(
     return target
 
 
-def inject_face_points_into_pose(pose: Any, target_face_points: List[Optional[Tuple[float, float]]]) -> Any:
-    original_face = getattr(pose, "face", None)
-    if original_face is None:
-        raise RuntimeError("Selected pose does not contain face keypoints.")
+def inject_face_points_into_landmarks(face_landmarks: Any, target_points: List[Optional[Tuple[float, float]]], landmark_pb2: Any) -> Any:
+    updated = landmark_pb2.NormalizedLandmarkList()
+    for idx, lm in enumerate(face_landmarks.landmark):
+        cloned = updated.landmark.add()
+        cloned.x = float(lm.x)
+        cloned.y = float(lm.y)
+        cloned.z = float(getattr(lm, "z", 0.0))
 
-    updated_face = []
-    for idx, kp in enumerate(original_face):
-        if idx >= len(target_face_points):
-            updated_face.append(kp)
-            continue
-        target_point = target_face_points[idx]
-        if target_point is None or kp is None:
-            updated_face.append(kp)
-            continue
-        updated_face.append(clone_keypoint_with_xy(kp, target_point[0], target_point[1]))
-
-    if hasattr(pose, "_replace"):
-        return pose._replace(face=updated_face)
-
-    clone_pose = copy.copy(pose)
-    setattr(clone_pose, "face", updated_face)
-    return clone_pose
+        point = target_points[idx] if idx < len(target_points) else None
+        if point is not None:
+            cloned.x = float(point[0])
+            cloned.y = float(point[1])
+    return updated
 
 
-def render_openpose_map(draw_poses_fn: Any, poses: List[Any], size: int) -> Image.Image:
-    canvas = draw_poses_fn(
-        poses,
-        H=size,
-        W=size,
-        draw_body=False,
-        draw_hand=False,
-        draw_face=True,
-    )
-    canvas = np.asarray(canvas, dtype=np.uint8)
-    if canvas.ndim != 3:
-        raise RuntimeError("OpenPose draw_poses returned an unexpected canvas format.")
+def render_mediapipe_map(mp: Any, face_landmark_list: List[Any], size: int) -> Image.Image:
+    canvas = np.zeros((size, size, 3), dtype=np.uint8)
+    drawing_utils = mp.solutions.drawing_utils
+    drawing_styles = mp.solutions.drawing_styles
+    face_mesh = mp.solutions.face_mesh
+
+    for face_landmarks in face_landmark_list:
+        drawing_utils.draw_landmarks(
+            image=canvas,
+            landmark_list=face_landmarks,
+            connections=face_mesh.FACEMESH_TESSELATION,
+            landmark_drawing_spec=None,
+            connection_drawing_spec=drawing_styles.get_default_face_mesh_tesselation_style(),
+        )
+        drawing_utils.draw_landmarks(
+            image=canvas,
+            landmark_list=face_landmarks,
+            connections=face_mesh.FACEMESH_CONTOURS,
+            landmark_drawing_spec=None,
+            connection_drawing_spec=drawing_styles.get_default_face_mesh_contours_style(),
+        )
+        try:
+            drawing_utils.draw_landmarks(
+                image=canvas,
+                landmark_list=face_landmarks,
+                connections=face_mesh.FACEMESH_IRISES,
+                landmark_drawing_spec=None,
+                connection_drawing_spec=drawing_styles.get_default_face_mesh_iris_connections_style(),
+            )
+        except Exception:
+            pass
     return Image.fromarray(canvas)
 
 
@@ -381,13 +364,13 @@ def build_inpaint_mask(face_points: List[Optional[Tuple[float, float]]], au_list
     return mask
 
 
-def load_pipeline(use_cuda: bool) -> StableDiffusionXLControlNetInpaintPipeline:
+def load_pipeline(use_cuda: bool) -> StableDiffusionControlNetInpaintPipeline:
     dtype = torch.float16 if use_cuda else torch.float32
     controlnet = ControlNetModel.from_pretrained(CONTROLNET_MODEL_ID, torch_dtype=dtype)
 
     checkpoint_path = Path(BASE_MODEL_ID).expanduser()
     if checkpoint_path.is_file():
-        pipe = StableDiffusionXLControlNetInpaintPipeline.from_single_file(
+        pipe = StableDiffusionControlNetInpaintPipeline.from_single_file(
             checkpoint_path.as_posix(),
             controlnet=controlnet,
             torch_dtype=dtype,
@@ -395,22 +378,21 @@ def load_pipeline(use_cuda: bool) -> StableDiffusionXLControlNetInpaintPipeline:
     elif "::" in BASE_MODEL_ID:
         repo_id, filename = BASE_MODEL_ID.split("::", 1)
         model_path = hf_hub_download(repo_id.strip(), filename.strip())
-        pipe = StableDiffusionXLControlNetInpaintPipeline.from_single_file(
+        pipe = StableDiffusionControlNetInpaintPipeline.from_single_file(
             model_path,
             controlnet=controlnet,
             torch_dtype=dtype,
         )
     else:
         try:
-            pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
+            pipe = StableDiffusionControlNetInpaintPipeline.from_pretrained(
                 BASE_MODEL_ID,
                 controlnet=controlnet,
                 torch_dtype=dtype,
                 use_safetensors=True,
             )
         except Exception:
-            # Fallback to a known SDXL inpainting base in case the main checkpoint is not inpaint-compatible.
-            pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
+            pipe = StableDiffusionControlNetInpaintPipeline.from_pretrained(
                 INPAINT_BASE_FALLBACK_MODEL_ID,
                 controlnet=controlnet,
                 torch_dtype=dtype,
@@ -437,25 +419,27 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
     input_image = Image.open(image_path).convert("RGB")
     input_image = ImageOps.fit(input_image, (parsed_size, parsed_size), method=Image.Resampling.LANCZOS)
 
-    openpose_detector, draw_poses_fn = load_openpose_backend()
-    poses = openpose_detector.detect_poses(
-        np.asarray(input_image, dtype=np.uint8),
-        include_hand=False,
-        include_face=True,
-    )
-    if not poses:
-        raise RuntimeError("OpenPose did not detect any pose in the input image.")
+    mp, landmark_pb2, mp_face_mesh = load_mediapipe_backend()
+    mp_result = mp_face_mesh.process(np.asarray(input_image, dtype=np.uint8))
+    face_landmark_list = list((mp_result.multi_face_landmarks or []))
+    mp_face_mesh.close()
+    if not face_landmark_list:
+        raise RuntimeError("MediaPipe did not detect any face landmarks in the input image.")
 
-    selected_idx = select_main_face_pose_index(poses)
-    selected_pose = poses[selected_idx]
-    original_face = extract_face_points(getattr(selected_pose, "face"))
+    selected_idx = select_main_face_index(face_landmark_list)
+    selected_face_landmarks = face_landmark_list[selected_idx]
+    original_face = extract_face_points(selected_face_landmarks)
     target_face = apply_au_deltas_to_face_points(original_face, parsed_aus)
 
-    modified_poses = list(poses)
-    modified_poses[selected_idx] = inject_face_points_into_pose(selected_pose, target_face)
+    modified_face_landmark_list = list(face_landmark_list)
+    modified_face_landmark_list[selected_idx] = inject_face_points_into_landmarks(
+        selected_face_landmarks,
+        target_face,
+        landmark_pb2,
+    )
 
-    original_control_image = render_openpose_map(draw_poses_fn, poses, parsed_size)
-    target_control_image = render_openpose_map(draw_poses_fn, modified_poses, parsed_size)
+    original_control_image = render_mediapipe_map(mp, face_landmark_list, parsed_size)
+    target_control_image = render_mediapipe_map(mp, modified_face_landmark_list, parsed_size)
     inpaint_mask = build_inpaint_mask(original_face, parsed_aus, parsed_size)
 
     out_dir = output if output is not None else OUTPUT_ROOT
@@ -507,18 +491,17 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
         "aus": [{"name": au.name, "intensity": au.intensity} for au in parsed_aus],
         "seed": run_seed,
         "image_size": parsed_size,
-        "selected_pose_index": selected_idx,
+        "selected_face_index": selected_idx,
         "base_model_id": BASE_MODEL_ID,
         "controlnet_model_id": CONTROLNET_MODEL_ID,
-        "openpose_annotators_repo": OPENPOSE_ANNOTATORS_REPO,
         "steps": STEPS,
         "cfg": CFG,
         "strength": INPAINT_STRENGTH,
         "controlnet_scale": CONTROLNET_SCALE,
         "prompt": prompt,
         "negative_prompt": BASE_NEGATIVE,
-        "openpose_face_original_path": original_face_path.as_posix(),
-        "openpose_face_target_path": target_face_path.as_posix(),
+        "mediapipe_face_original_path": original_face_path.as_posix(),
+        "mediapipe_face_target_path": target_face_path.as_posix(),
         "control_image_original_path": control_original_path.as_posix(),
         "control_image_target_path": control_target_path.as_posix(),
         "inpaint_mask_path": mask_path.as_posix(),
@@ -528,7 +511,7 @@ def run(image_path: Path, aus: List[str], image_size: int, seed: int | None, out
         json.dump(meta, file, indent=2)
 
     print(f"Done. Result image: {result_path.as_posix()}")
-    print(f"OpenPose target control map: {control_target_path.as_posix()}")
+    print(f"MediaPipe target control map: {control_target_path.as_posix()}")
     print(f"Meta: {meta_path.as_posix()}")
 
 
@@ -541,7 +524,7 @@ def main() -> None:
         required=True,
         help="List of AUs (e.g. AU4 AU7 or AU4=1.2 AU7=0.8). Supported: AU4, AU7, AU23, AU24.",
     )
-    parser.add_argument("--image_size", type=int, default=1024, help="Square working size for OpenPose and generation.")
+    parser.add_argument("--image_size", type=int, default=768, help="Square working size for MediaPipe and generation.")
     parser.add_argument("--seed", type=int, help="Optional generation seed.")
     parser.add_argument("--output", type=Path, help="Optional output directory.")
     args = parser.parse_args()
