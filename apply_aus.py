@@ -48,16 +48,28 @@ INPAINT_BASE_FALLBACK_MODEL_ID = "stabilityai/stable-diffusion-2-inpainting"
 AU_DELTAS: Dict[str, Dict[int, Tuple[float, float]]] = {
     # AU4: Brow lowerer
     "AU4": {
+        # Upper brow arc
         70: (0.003, 0.018),
         63: (0.002, 0.020),
-        105: (0.001, 0.021),
-        66: (0.000, 0.020),
-        107: (-0.001, 0.018),
-        336: (0.001, 0.018),
-        296: (0.000, 0.020),
-        334: (-0.001, 0.021),
+        105: (0.003, 0.021),
+        66: (0.002, 0.020),
+        107: (0.004, 0.018),
+        336: (-0.004, 0.018),
+        296: (-0.002, 0.020),
+        334: (-0.003, 0.021),
         293: (-0.002, 0.020),
         300: (-0.003, 0.018),
+        # Lower brow border (to avoid moving only the top arc)
+        46: (0.001, 0.010),
+        53: (0.001, 0.011),
+        52: (0.002, 0.012),
+        65: (0.002, 0.012),
+        55: (0.003, 0.011),
+        285: (-0.003, 0.011),
+        295: (-0.002, 0.012),
+        282: (-0.002, 0.012),
+        283: (-0.001, 0.011),
+        276: (-0.001, 0.010),
     },
     # AU7: Lid tightener
     "AU7": {
@@ -76,22 +88,28 @@ AU_DELTAS: Dict[str, Dict[int, Tuple[float, float]]] = {
     },
     # AU23: Lip tightener (corners inward + lips tense)
     "AU23": {
-        61: (0.010, 0.000),
-        291: (-0.010, 0.000),
-        13: (0.000, -0.003),
-        14: (0.000, 0.003),
+        61: (0.014, 0.000),
+        291: (-0.014, 0.000),
+        146: (0.010, 0.000),
+        375: (-0.010, 0.000),
+        13: (0.000, 0.003),
+        14: (0.000, -0.003),
     },
     # AU24: Lip pressor (reduce mouth aperture)
     "AU24": {
-        13: (0.000, 0.008),
-        14: (0.000, -0.008),
-        78: (0.000, 0.005),
-        308: (0.000, -0.005),
+        13: (0.000, 0.012),
+        14: (0.000, -0.012),
+        78: (0.000, 0.008),
+        308: (0.000, -0.008),
+        191: (0.000, 0.006),
+        415: (0.000, 0.006),
+        87: (0.000, -0.006),
+        324: (0.000, -0.006),
     },
 }
 
 AU_TEXT: Dict[str, str] = {
-    "AU4": "brows lowered and drawn together",
+    "AU4": "brows lowered and drawn together with glabellar vertical crease between the eyebrows",
     "AU7": "eyelids tightened",
     "AU23": "lips tightened",
     "AU24": "lips pressed",
@@ -100,6 +118,7 @@ AU_TEXT: Dict[str, str] = {
 # MediaPipe Face Mesh regions.
 FACE_REGIONS: Dict[str, List[int]] = {
     "brows": [70, 63, 105, 66, 107, 336, 296, 334, 293, 300],
+    "glabella": [107, 66, 105, 9, 336, 296, 334, 168],
     "left_eye": [33, 160, 159, 158, 133, 153, 145, 144],
     "right_eye": [362, 385, 386, 387, 263, 373, 374, 380],
     "outer_mouth": [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291],
@@ -108,7 +127,7 @@ FACE_REGIONS: Dict[str, List[int]] = {
 
 # Which regions should be editable per AU.
 AU_TO_MASK_REGIONS: Dict[str, List[str]] = {
-    "AU4": ["brows"],
+    "AU4": ["brows", "glabella"],
     "AU7": ["left_eye", "right_eye"],
     "AU23": ["outer_mouth", "inner_mouth"],
     "AU24": ["outer_mouth", "inner_mouth"],
