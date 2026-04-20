@@ -20,7 +20,7 @@ from huggingface_hub import hf_hub_download
 # ---------------------------------------
 # Global generation settings (not CLI)
 # ---------------------------------------
-BASE_MODEL_ID = "stabilityai/stable-diffusion-2-1"
+BASE_MODEL_ID = "sd2-community/stable-diffusion-2-1"
 CONTROLNET_MODEL_ID = "CrucibleAI/ControlNetMediaPipeFace"
 
 STEPS = 24
