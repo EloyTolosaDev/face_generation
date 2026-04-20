@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 import itertools
 import json
+import os
 import random
 import re
 import time
@@ -15,6 +16,7 @@ from tqdm import tqdm
 # Global generation settings
 # ---------------------------------------
 MODEL_ID = "stabilityai/stable-diffusion-2-1"
+MODEL_FALLBACK_ID = "WIBE-HuggingFace/stable-diffusion-2-1-base"
 OUTPUT_ROOT = Path("./samples")
 SAMPLE_IMAGE_SIZE = 768
 NEUTRAL_STEPS = 20
@@ -60,14 +62,34 @@ def compose_neutral_prompt(demographic_text: str) -> str:
     return f"{demographic_text}, {BASE_POSITIVE}, {NEUTRAL_TEMPLATE_SUFFIX}"
 
 
-def load_text2img_pipe(use_cuda: bool) -> StableDiffusionPipeline:
+def load_text2img_pipe(use_cuda: bool) -> tuple[StableDiffusionPipeline, str]:
     dtype = torch.float16 if use_cuda else torch.float32
 
-    pipe = StableDiffusionPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=dtype,
-        use_safetensors=True,
-    )
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    candidate_model_ids = [MODEL_ID, MODEL_FALLBACK_ID]
+    last_error: Exception | None = None
+    pipe: StableDiffusionPipeline | None = None
+    resolved_model_id = MODEL_ID
+
+    for model_id in candidate_model_ids:
+        try:
+            pipe = StableDiffusionPipeline.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                use_safetensors=True,
+                token=token,
+            )
+            resolved_model_id = model_id
+            break
+        except Exception as exc:  # pragma: no cover - runtime dependency/network behavior
+            last_error = exc
+
+    if pipe is None:
+        raise RuntimeError(
+            "Could not load any configured SD2.1 sample model. "
+            "If using stabilityai repos, ensure your HF account accepted the model license and set HF_TOKEN. "
+            f"Last error: {last_error}"
+        )
 
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     device = "cuda" if use_cuda else "cpu"
@@ -78,7 +100,7 @@ def load_text2img_pipe(use_cuda: bool) -> StableDiffusionPipeline:
         except Exception:
             pass
 
-    return pipe.to(device)
+    return pipe.to(device), resolved_model_id
 
 
 def normalize_image_size(size: int) -> int:
@@ -101,7 +123,8 @@ def generate_samples(seeds_per_combination: int) -> None:
 
     combinations = get_combinations()
     total = len(combinations) * seeds_per_combination
-    pipe = load_text2img_pipe(use_cuda=use_cuda)
+    pipe, resolved_model_id = load_text2img_pipe(use_cuda=use_cuda)
+    print(f"Using sample model: {resolved_model_id}")
 
     rng = random.Random(time.time_ns())
     device = "cuda" if use_cuda else "cpu"
@@ -141,7 +164,7 @@ def generate_samples(seeds_per_combination: int) -> None:
                     "kind": "neutral_sample",
                     "seed": seed,
                     "sample_index": sample_index,
-                    "model_id": MODEL_ID,
+                    "model_id": resolved_model_id,
                     "img_size": img_size,
                     "steps": NEUTRAL_STEPS,
                     "cfg": NEUTRAL_CFG,
