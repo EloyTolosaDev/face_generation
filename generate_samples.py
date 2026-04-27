@@ -14,9 +14,9 @@ from tqdm import tqdm
 # ---------------------------------------
 # Global generation settings
 # ---------------------------------------
-MODEL_ID = "stabilityai/stable-diffusion-2-1"
+MODEL_ID = "dreamlike-art/dreamlike-photoreal-2.0"
 OUTPUT_ROOT = Path("./samples")
-SAMPLE_IMAGE_SIZE = 768
+SAMPLE_IMAGE_SIZE = 512
 NEUTRAL_STEPS = 20
 NEUTRAL_CFG = 3.0
 
